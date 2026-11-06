@@ -1825,8 +1825,12 @@ zypper x' ;;
 
 # ========== SCAN ==========
 FOUND=0
+FOUND_GTFO=0
+FOUND_OTHER_USER=0
+ME=$(id -un 2>/dev/null || whoami 2>/dev/null)
+MY_GROUPS=$(id -Gn 2>/dev/null)
 
-header() { echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════${NC}"; echo -e "${BOLD}${CYAN}  $1${NC}"; echo -e "${BOLD}${CYAN}══════════════════════════════════════════${NC}"; }
+header() { echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════════════════${NC}"; echo -e "${BOLD}${CYAN}  $1${NC}"; echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════${NC}"; }
 
 show_hit() {
     local type="$1" path="$2" funcs="$3" extra="$4"
@@ -1834,6 +1838,16 @@ show_hit() {
     echo -e "    Path: $path"
     [ -n "$extra" ] && echo -e "    $extra"
     FOUND=$((FOUND+1))
+}
+
+show_owner_hit() {
+    local path="$1" owner="$2" group="$3" perms="$4" type="$5"
+    local color="$YELLOW"
+    [ "$owner" = "root" ] && color="$RED"
+    echo -e "  ${color}→${NC} ${BOLD}$(basename "$path")${NC}  runs as ${color}${BOLD}${owner}${NC}:${group} ${CYAN}[$type]${NC}"
+    echo -e "    Path: $path  Perms: $perms"
+    FOUND=$((FOUND+1))
+    FOUND_OTHER_USER=$((FOUND_OTHER_USER+1))
 }
 
 show_exploit() {
@@ -1848,29 +1862,87 @@ show_exploit() {
 
 # --- SUID ---
 header "SUID Binaries (-perm -4000)"
-while IFS= read -r file; do
-    [ -z "$file" ] && continue
+echo -e "  ${CYAN}[GTFOBins matches]${NC}"
+while IFS= read -r entry; do
+    [ -z "$entry" ] && continue
+    file=$(echo "$entry" | awk '{print $NF}')
+    owner=$(echo "$entry" | awk '{print $3}')
+    group=$(echo "$entry" | awk '{print $4}')
+    perms=$(echo "$entry" | awk '{print $1}')
     b=$(basename "$file")
     result=$(is_suid_exploitable "$b") && {
-        show_hit "SUID" "$file" "$result"
+        show_hit "SUID" "$file" "$result" "Owner: ${owner}:${group}"
         show_exploit "$(get_suid_exploit "$b")"
+        FOUND_GTFO=$((FOUND_GTFO+1))
     }
-done < <(find / -perm -4000 -type f 2>/dev/null)
+done < <(find / -perm -4000 -type f -exec ls -la {} \; 2>/dev/null)
+
+echo ""
+echo -e "  ${CYAN}[Non-root SUID owners — lateral movement]${NC}"
+while IFS= read -r entry; do
+    [ -z "$entry" ] && continue
+    file=$(echo "$entry" | awk '{print $NF}')
+    owner=$(echo "$entry" | awk '{print $3}')
+    group=$(echo "$entry" | awk '{print $4}')
+    perms=$(echo "$entry" | awk '{print $1}')
+    [ "$owner" = "root" ] && continue
+    [ "$owner" = "$ME" ] && continue
+    show_owner_hit "$file" "$owner" "$group" "$perms" "SUID"
+done < <(find / -perm -4000 -type f -exec ls -la {} \; 2>/dev/null)
 
 # --- SGID ---
 header "SGID Binaries (-perm -2000)"
-while IFS= read -r file; do
-    [ -z "$file" ] && continue
+echo -e "  ${CYAN}[GTFOBins matches]${NC}"
+while IFS= read -r entry; do
+    [ -z "$entry" ] && continue
+    file=$(echo "$entry" | awk '{print $NF}')
+    owner=$(echo "$entry" | awk '{print $3}')
+    group=$(echo "$entry" | awk '{print $4}')
+    perms=$(echo "$entry" | awk '{print $1}')
     b=$(basename "$file")
     result=$(is_suid_exploitable "$b") && {
-        show_hit "SGID" "$file" "$result"
+        show_hit "SGID" "$file" "$result" "Group: ${group}"
         show_exploit "$(get_suid_exploit "$b")"
+        FOUND_GTFO=$((FOUND_GTFO+1))
     }
-done < <(find / -perm -2000 -type f 2>/dev/null)
+done < <(find / -perm -2000 -type f -exec ls -la {} \; 2>/dev/null)
+
+echo ""
+echo -e "  ${CYAN}[SGID with groups you're not in — lateral movement]${NC}"
+while IFS= read -r entry; do
+    [ -z "$entry" ] && continue
+    file=$(echo "$entry" | awk '{print $NF}')
+    owner=$(echo "$entry" | awk '{print $3}')
+    group=$(echo "$entry" | awk '{print $4}')
+    perms=$(echo "$entry" | awk '{print $1}')
+    echo "$MY_GROUPS" | grep -qw "$group" && continue
+    show_owner_hit "$file" "$owner" "$group" "$perms" "SGID→$group"
+done < <(find / -perm -2000 -type f -exec ls -la {} \; 2>/dev/null)
+
+# --- Files owned by other users that are writable ---
+header "Writable files owned by other users"
+echo -e "  ${CYAN}[Files you can write but belong to someone else — hijack/overwrite]${NC}"
+WRITABLE_COUNT=0
+while IFS= read -r entry; do
+    [ -z "$entry" ] && continue
+    file=$(echo "$entry" | awk '{print $NF}')
+    owner=$(echo "$entry" | awk '{print $3}')
+    group=$(echo "$entry" | awk '{print $4}')
+    perms=$(echo "$entry" | awk '{print $1}')
+    [ "$owner" = "$ME" ] && continue
+    echo -e "  ${YELLOW}→${NC} ${BOLD}$(basename "$file")${NC}  owned by ${YELLOW}${BOLD}${owner}${NC}:${group}"
+    echo -e "    Path: $file  Perms: $perms"
+    WRITABLE_COUNT=$((WRITABLE_COUNT+1))
+    FOUND=$((FOUND+1))
+    [ "$WRITABLE_COUNT" -ge 50 ] && echo -e "  ${YELLOW}... (showing first 50)${NC}" && break
+done < <(find / -writable -type f ! -user "$ME" \
+    ! -path "/proc/*" ! -path "/sys/*" ! -path "/dev/*" ! -path "/run/*" \
+    -exec ls -la {} \; 2>/dev/null)
 
 # --- Capabilities ---
 header "Capabilities (getcap)"
 if command -v getcap &>/dev/null; then
+    echo -e "  ${CYAN}[GTFOBins matches]${NC}"
     while IFS= read -r line; do
         [ -z "$line" ] && continue
         file=$(echo "$line" | awk '{print $1}')
@@ -1879,7 +1951,19 @@ if command -v getcap &>/dev/null; then
         result=$(is_cap_exploitable "$b") && {
             show_hit "CAP" "$file" "${result%%|*}" "Caps: $caps"
             show_exploit "$(get_cap_exploit "$b")"
+            FOUND_GTFO=$((FOUND_GTFO+1))
         }
+    done < <(getcap -r / 2>/dev/null)
+
+    echo ""
+    echo -e "  ${CYAN}[All capabilities — review manually]${NC}"
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        file=$(echo "$line" | awk '{print $1}')
+        caps=$(echo "$line" | sed 's/^.* = //')
+        owner=$(stat -c '%U:%G' "$file" 2>/dev/null || stat -f '%Su:%Sg' "$file" 2>/dev/null)
+        echo -e "  ${YELLOW}•${NC} $(basename "$file")  ${CYAN}$caps${NC}  owner: $owner"
+        echo -e "    Path: $file"
     done < <(getcap -r / 2>/dev/null)
 else
     echo -e "  ${RED}getcap not found${NC}"
@@ -1888,15 +1972,22 @@ fi
 # --- Sudo ---
 header "Sudo Permissions"
 if sudo -n -l 2>/dev/null | grep -q "("; then
+    echo -e "  ${CYAN}[Full sudo -l output]${NC}"
+    sudo -n -l 2>/dev/null | while IFS= read -r line; do
+        echo -e "  $line"
+    done
+
+    echo ""
+    echo -e "  ${CYAN}[GTFOBins matches]${NC}"
     while IFS= read -r line; do
         [ -z "$line" ] && continue
-        # Extract binary path from sudo -l output
         bin_path=$(echo "$line" | sed -n 's/.*\(\/[^ ]*\).*/\1/p' | head -1)
         [ -z "$bin_path" ] && continue
         b=$(basename "$bin_path")
         result=$(is_sudo_exploitable "$b") && {
             show_hit "SUDO" "$bin_path" "$result" "Rule: $line"
             show_exploit "$(get_sudo_exploit "$b")"
+            FOUND_GTFO=$((FOUND_GTFO+1))
         }
     done < <(sudo -n -l 2>/dev/null | grep -E '^\s+/')
 else
@@ -1905,11 +1996,15 @@ fi
 
 # --- Summary ---
 echo ""
-echo -e "${BOLD}══════════════════════════════════════════${NC}"
+echo -e "${BOLD}══════════════════════════════════════════════════════${NC}"
 if [ "$FOUND" -gt 0 ]; then
-    echo -e "${GREEN}${BOLD}  $FOUND exploitable binary/binaries found!${NC}"
-    echo -e "  Details: ${CYAN}https://gtfobins.github.io/${NC}"
+    echo -e "${GREEN}${BOLD}  $FOUND findings total${NC}"
+    [ "$FOUND_GTFO" -gt 0 ] && echo -e "  ${GREEN}├─ $FOUND_GTFO GTFOBins exploitable${NC}"
+    [ "$FOUND_OTHER_USER" -gt 0 ] && echo -e "  ${YELLOW}├─ $FOUND_OTHER_USER run-as-other-user (lateral movement)${NC}"
+    OTHER=$((FOUND - FOUND_GTFO - FOUND_OTHER_USER))
+    [ "$OTHER" -gt 0 ] && echo -e "  ${CYAN}└─ $OTHER other interesting files${NC}"
+    echo -e "  Reference: ${CYAN}https://gtfobins.github.io/${NC}"
 else
-    echo -e "${YELLOW}  No known GTFOBins exploitables found.${NC}"
+    echo -e "${YELLOW}  No known exploitables found.${NC}"
 fi
-echo -e "${BOLD}══════════════════════════════════════════${NC}"
+echo -e "${BOLD}══════════════════════════════════════════════════════${NC}"
