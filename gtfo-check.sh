@@ -1971,15 +1971,44 @@ fi
 
 # --- Sudo ---
 header "Sudo Permissions"
-if sudo -n -l 2>/dev/null | grep -q "("; then
+SUDO_OUTPUT=""
+# Try sudo -n -l first (no password needed: NOPASSWD or cached creds)
+SUDO_OUTPUT=$(sudo -n -l 2>/dev/null)
+if [ $? -ne 0 ] || [ -z "$SUDO_OUTPUT" ]; then
+    # Try sudo -l with empty stdin (some configs allow it)
+    SUDO_OUTPUT=$(echo "" | sudo -S -l 2>/dev/null)
+fi
+# Also check /etc/sudoers and sudoers.d if readable
+SUDOERS_READABLE=false
+if [ -r /etc/sudoers ]; then
+    SUDOERS_READABLE=true
+    echo -e "  ${GREEN}/etc/sudoers is readable!${NC}"
+    grep -v '^#' /etc/sudoers 2>/dev/null | grep -v '^$' | while IFS= read -r line; do
+        echo -e "  $line"
+    done
+    echo ""
+fi
+if [ -d /etc/sudoers.d ] && ls -la /etc/sudoers.d/ 2>/dev/null | grep -q "^-..r"; then
+    echo -e "  ${GREEN}/etc/sudoers.d/ has readable files:${NC}"
+    for sf in /etc/sudoers.d/*; do
+        [ -r "$sf" ] || continue
+        echo -e "  ${CYAN}--- $(basename "$sf") ---${NC}"
+        grep -v '^#' "$sf" 2>/dev/null | grep -v '^$' | while IFS= read -r line; do
+            echo -e "  $line"
+        done
+    done
+    echo ""
+fi
+
+if echo "$SUDO_OUTPUT" | grep -q "/"; then
     echo -e "  ${CYAN}[Full sudo -l output]${NC}"
-    sudo -n -l 2>/dev/null | while IFS= read -r line; do
+    echo "$SUDO_OUTPUT" | while IFS= read -r line; do
         echo -e "  $line"
     done
 
     echo ""
     echo -e "  ${CYAN}[GTFOBins matches]${NC}"
-    while IFS= read -r line; do
+    echo "$SUDO_OUTPUT" | grep -E '^\s+/' | while IFS= read -r line; do
         [ -z "$line" ] && continue
         bin_path=$(echo "$line" | sed -n 's/.*\(\/[^ ]*\).*/\1/p' | head -1)
         [ -z "$bin_path" ] && continue
@@ -1989,9 +2018,10 @@ if sudo -n -l 2>/dev/null | grep -q "("; then
             show_exploit "$(get_sudo_exploit "$b")"
             FOUND_GTFO=$((FOUND_GTFO+1))
         }
-    done < <(sudo -n -l 2>/dev/null | grep -E '^\s+/')
-else
-    echo -e "  ${YELLOW}Cannot check sudo (need NOPASSWD or cached creds)${NC}"
+    done
+elif [ "$SUDOERS_READABLE" = false ]; then
+    echo -e "  ${YELLOW}Cannot check sudo — no password, no cached creds, sudoers not readable${NC}"
+    echo -e "  ${YELLOW}Tip: if you get a password later, run: sudo -l${NC}"
 fi
 
 # --- Summary ---
