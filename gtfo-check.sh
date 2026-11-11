@@ -1941,6 +1941,29 @@ while IFS= read -r entry; do
     show_owner_hit "$file" "$owner" "$group" "$perms" "SGID→$group"
 done <<< "$SGID_CACHE"
 
+# --- Writable files owned by other users (scoped to useful dirs, with timeout) ---
+WRITABLE_CACHE=$(timeout 30 find /etc /opt /var /usr/local /home /root /tmp /srv \
+    -writable -type f ! -user "$ME" \
+    ! -path "/var/lib/*" ! -path "/var/cache/*" ! -path "/var/log/*" \
+    -exec ls -la {} \; 2>/dev/null)
+if [ -n "$WRITABLE_CACHE" ]; then
+    header "Writable Files Owned by Other Users"
+    WRITABLE_COUNT=0
+    while IFS= read -r entry; do
+        [ -z "$entry" ] && continue
+        file=$(echo "$entry" | awk '{print $NF}')
+        owner=$(echo "$entry" | awk '{print $3}')
+        group=$(echo "$entry" | awk '{print $4}')
+        perms=$(echo "$entry" | awk '{print $1}')
+        [ "$owner" = "$ME" ] && continue
+        echo -e "  ${YELLOW}→${NC} ${BOLD}$(basename "$file")${NC}  owned by ${YELLOW}${BOLD}${owner}${NC}:${group}"
+        echo -e "    Path: $file  Perms: $perms"
+        WRITABLE_COUNT=$((WRITABLE_COUNT+1))
+        FOUND=$((FOUND+1))
+        [ "$WRITABLE_COUNT" -ge 30 ] && echo -e "  ${YELLOW}... (max 30 shown)${NC}" && break
+    done <<< "$WRITABLE_CACHE"
+fi
+
 # --- Capabilities ---
 if command -v getcap &>/dev/null; then
     CAP_OUTPUT=$(timeout 20 getcap -r / 2>/dev/null)
