@@ -1878,6 +1878,10 @@ show_exploit() {
     fi
 }
 
+# --- Cache heavy scans (each runs ONCE with timeout) ---
+SUID_CACHE=$(timeout 30 find / -perm -4000 -type f -exec ls -la {} \; 2>/dev/null)
+SGID_CACHE=$(timeout 30 find / -perm -2000 -type f -exec ls -la {} \; 2>/dev/null)
+
 # --- SUID ---
 header "SUID Binaries (-perm -4000)"
 echo -e "  ${CYAN}[GTFOBins matches]${NC}"
@@ -1893,7 +1897,7 @@ while IFS= read -r entry; do
         show_exploit "$(get_suid_exploit "$b")"
         FOUND_GTFO=$((FOUND_GTFO+1))
     }
-done < <(find / -perm -4000 -type f -exec ls -la {} \; 2>/dev/null)
+done <<< "$SUID_CACHE"
 
 echo ""
 echo -e "  ${CYAN}[Non-root SUID owners — lateral movement]${NC}"
@@ -1906,7 +1910,7 @@ while IFS= read -r entry; do
     [ "$owner" = "root" ] && continue
     [ "$owner" = "$ME" ] && continue
     show_owner_hit "$file" "$owner" "$group" "$perms" "SUID"
-done < <(find / -perm -4000 -type f -exec ls -la {} \; 2>/dev/null)
+done <<< "$SUID_CACHE"
 
 # --- SGID ---
 header "SGID Binaries (-perm -2000)"
@@ -1923,7 +1927,7 @@ while IFS= read -r entry; do
         show_exploit "$(get_suid_exploit "$b")"
         FOUND_GTFO=$((FOUND_GTFO+1))
     }
-done < <(find / -perm -2000 -type f -exec ls -la {} \; 2>/dev/null)
+done <<< "$SGID_CACHE"
 
 echo ""
 echo -e "  ${CYAN}[SGID with groups you're not in — lateral movement]${NC}"
@@ -1935,31 +1939,11 @@ while IFS= read -r entry; do
     perms=$(echo "$entry" | awk '{print $1}')
     echo "$MY_GROUPS" | grep -qw "$group" && continue
     show_owner_hit "$file" "$owner" "$group" "$perms" "SGID→$group"
-done < <(find / -perm -2000 -type f -exec ls -la {} \; 2>/dev/null)
-
-# --- Files owned by other users that are writable ---
-header "Writable files owned by other users"
-echo -e "  ${CYAN}[Files you can write but belong to someone else — hijack/overwrite]${NC}"
-WRITABLE_COUNT=0
-while IFS= read -r entry; do
-    [ -z "$entry" ] && continue
-    file=$(echo "$entry" | awk '{print $NF}')
-    owner=$(echo "$entry" | awk '{print $3}')
-    group=$(echo "$entry" | awk '{print $4}')
-    perms=$(echo "$entry" | awk '{print $1}')
-    [ "$owner" = "$ME" ] && continue
-    echo -e "  ${YELLOW}→${NC} ${BOLD}$(basename "$file")${NC}  owned by ${YELLOW}${BOLD}${owner}${NC}:${group}"
-    echo -e "    Path: $file  Perms: $perms"
-    WRITABLE_COUNT=$((WRITABLE_COUNT+1))
-    FOUND=$((FOUND+1))
-    [ "$WRITABLE_COUNT" -ge 50 ] && echo -e "  ${YELLOW}... (showing first 50)${NC}" && break
-done < <(find / -writable -type f ! -user "$ME" \
-    ! -path "/proc/*" ! -path "/sys/*" ! -path "/dev/*" ! -path "/run/*" \
-    -exec ls -la {} \; 2>/dev/null)
+done <<< "$SGID_CACHE"
 
 # --- Capabilities ---
 if command -v getcap &>/dev/null; then
-    CAP_OUTPUT=$(getcap -r / 2>/dev/null)
+    CAP_OUTPUT=$(timeout 20 getcap -r / 2>/dev/null)
     if [ -n "$CAP_OUTPUT" ]; then
         header "Capabilities (getcap)"
         echo -e "  ${CYAN}[GTFOBins matches]${NC}"
