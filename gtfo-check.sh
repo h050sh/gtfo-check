@@ -1880,7 +1880,7 @@ show_exploit() {
 
 # --- Cache heavy scans (each runs ONCE with timeout) ---
 SUID_CACHE=$(timeout 30 find / -perm -4000 -type f -exec ls -la {} \; 2>/dev/null)
-SGID_CACHE=$(timeout 30 find / -perm -2000 -type f -exec ls -la {} \; 2>/dev/null)
+SGID_CACHE=$(timeout 30 find / -perm -2000 -type f -not -path "/snap/*" -exec ls -la {} \; 2>/dev/null)
 
 # --- SUID ---
 header "SUID Binaries (-perm -4000)"
@@ -2267,10 +2267,10 @@ done
 ENV_COUNT=0
 while IFS= read -r envfile; do
     [ -z "$envfile" ] && continue
-    if grep -qiE '(password|passwd|pwd|secret|token|api_key|apikey|db_pass)' "$envfile" 2>/dev/null; then
+    if grep -inE '(password|passwd|pwd|secret|token|api_key|apikey|db_pass)\s*[=:]\s*\S' "$envfile" 2>/dev/null | grep -vE '^\s*#|^\s*//|^\s*;|^\s*\*' | grep -q .; then
         show_cred_header
         echo -e "  ${GREEN}✓ Potential creds:${NC} $envfile"
-        grep -inE '(password|passwd|pwd|secret|token|api_key|apikey|db_pass)' "$envfile" 2>/dev/null | head -3 | while IFS= read -r match; do
+        grep -inE '(password|passwd|pwd|secret|token|api_key|apikey|db_pass)\s*[=:]\s*\S' "$envfile" 2>/dev/null | grep -vE '^\s*#|^\s*//|^\s*;|^\s*\*' | head -3 | while IFS= read -r match; do
             echo -e "    $match"
         done
         ENV_COUNT=$((ENV_COUNT+1))
@@ -2279,6 +2279,181 @@ while IFS= read -r envfile; do
     fi
     [ "$ENV_COUNT" -ge 20 ] && break
 done < <(find /var/www /opt /srv /home /etc -maxdepth 3 \( -name '.env' -o -name '*.conf' -o -name '*.cfg' -o -name '*.ini' -o -name 'wp-config.php' -o -name 'config.php' -o -name 'database.yml' -o -name 'settings.py' -o -name 'application.properties' \) -readable -type f 2>/dev/null)
+
+# --- Backup files & non-default directories ---
+BACKUP_FILES=$(timeout 20 find /opt /srv /tmp /var/backups /backup /backups /home \
+    -type f \( -name "*.zip" -o -name "*.tar*" -o -name "*.gz" -o -name "*.bz2" \
+    -o -name "*.bak" -o -name "*.old" -o -name "*.backup" -o -name "*.sql" \
+    -o -name "*.db" -o -name "*.sqlite" -o -name "*.kdbx" -o -name "*.conf" \
+    -o -name "*.config" \) -readable 2>/dev/null)
+if [ -n "$BACKUP_FILES" ]; then
+    header "Backup Files & Archives"
+    BACKUP_COUNT=0
+    while IFS= read -r bf; do
+        [ -z "$bf" ] && continue
+        ftype=$(file -b "$bf" 2>/dev/null | cut -c1-60)
+        echo -e "  ${GREEN}✓${NC} ${BOLD}$bf${NC}"
+        echo -e "    Type: ${CYAN}$ftype${NC}"
+        FOUND=$((FOUND+1))
+        FOUND_EXTRA=$((FOUND_EXTRA+1))
+        BACKUP_COUNT=$((BACKUP_COUNT+1))
+        [ "$BACKUP_COUNT" -ge 30 ] && echo -e "  ${YELLOW}... (max 30 shown)${NC}" && break
+    done <<< "$BACKUP_FILES"
+    echo -e "    ${CYAN}Suggestion:${NC} ${GREEN}unzip/tar xf interesting archives and grep for passwords${NC}"
+fi
+
+# --- Web application config files ---
+WEBAPP_HEADER_SHOWN=false
+show_webapp_header() {
+    if [ "$WEBAPP_HEADER_SHOWN" = false ]; then
+        header "Web Application Config Files"
+        WEBAPP_HEADER_SHOWN=true
+    fi
+}
+while IFS= read -r wcf; do
+    [ -z "$wcf" ] && continue
+    CRED_LINES=$(grep -inE '(password|passwd|pwd|secret|db_pass|db_password|api_key|token)\s*[=:>\]]\s*\S' "$wcf" 2>/dev/null | grep -vE '^\s*#|^\s*//|^\s*;|^\s*\*|example|changeme|placeholder|your_' | head -5)
+    if [ -n "$CRED_LINES" ]; then
+        show_webapp_header
+        echo -e "  ${RED}✗${NC} ${BOLD}$wcf${NC}"
+        echo "$CRED_LINES" | while IFS= read -r cl; do
+            echo -e "    ${GREEN}$cl${NC}"
+        done
+        FOUND=$((FOUND+1))
+        FOUND_EXTRA=$((FOUND_EXTRA+1))
+    elif [ -r "$wcf" ]; then
+        show_webapp_header
+        echo -e "  ${GREEN}✓${NC} ${BOLD}$wcf${NC} (readable, no obvious creds found — check manually)"
+        FOUND=$((FOUND+1))
+        FOUND_EXTRA=$((FOUND_EXTRA+1))
+    fi
+done < <(find /var/www /opt /srv -type f \( \
+    -name "configuration.php" -o -name "wp-config.php" -o -name ".env" \
+    -o -name "config.php" -o -name "settings.py" -o -name "database.yml" \
+    -o -name "appsettings.json" -o -name "conn*.php" -o -name "db.php" \
+    \) -readable 2>/dev/null)
+
+# --- Other users' readable home dirs ---
+HOME_READABLE=""
+if [ -d /home ]; then
+    HOME_DIR_PERMS=$(ls -la /home/ 2>/dev/null | grep '^d' | grep -v '^\.\.$' | grep -v '^\.$' | grep -v "total")
+    HOME_WORLD_READABLE=""
+    while IFS= read -r hline; do
+        [ -z "$hline" ] && continue
+        hperms=$(echo "$hline" | awk '{print $1}')
+        huser=$(echo "$hline" | awk '{print $NF}')
+        [ "$huser" = "$ME" ] && continue
+        [ "$huser" = "." ] || [ "$huser" = ".." ] && continue
+        echo "$hperms" | grep -q 'r..$' && HOME_WORLD_READABLE="${HOME_WORLD_READABLE}${huser} (${hperms})\n"
+    done <<< "$HOME_DIR_PERMS"
+
+    OTHER_HOME_FILES=$(timeout 15 find /home -readable -not -user "$ME" -type f \
+        ! -path "*/snap/*" ! -path "*/.cache/*" ! -path "*/.local/share/Trash/*" \
+        2>/dev/null | head -30)
+
+    if [ -n "$HOME_WORLD_READABLE" ] || [ -n "$OTHER_HOME_FILES" ]; then
+        header "Other Users' Readable Home Dirs"
+        if [ -n "$HOME_WORLD_READABLE" ]; then
+            echo -e "  ${CYAN}[World-readable home directories]${NC}"
+            echo -e "$HOME_WORLD_READABLE" | while IFS= read -r hentry; do
+                [ -z "$hentry" ] && continue
+                echo -e "  ${RED}✗${NC} ${BOLD}/home/$hentry${NC}"
+                FOUND=$((FOUND+1))
+                FOUND_EXTRA=$((FOUND_EXTRA+1))
+            done
+        fi
+        if [ -n "$OTHER_HOME_FILES" ]; then
+            echo -e "  ${CYAN}[Readable files in other users' homes]${NC}"
+            while IFS= read -r ohf; do
+                [ -z "$ohf" ] && continue
+                echo -e "  ${GREEN}✓${NC} $ohf"
+                FOUND=$((FOUND+1))
+                FOUND_EXTRA=$((FOUND_EXTRA+1))
+            done <<< "$OTHER_HOME_FILES"
+        fi
+    fi
+fi
+
+# --- Cloud-init userdata ---
+if [ -r /var/lib/cloud/instance/user-data.txt ] && [ -s /var/lib/cloud/instance/user-data.txt ]; then
+    header "Cloud-init User Data"
+    show_extra "Readable: /var/lib/cloud/instance/user-data.txt" "Cloud VMs often store passwords here" "cat /var/lib/cloud/instance/user-data.txt"
+    grep -inE '(password|passwd|pwd|secret|token)' /var/lib/cloud/instance/user-data.txt 2>/dev/null | head -5 | while IFS= read -r cline; do
+        echo -e "    ${GREEN}$cline${NC}"
+    done
+fi
+
+# --- Non-default directories in /opt, /srv ---
+OPT_SRV_HITS=""
+for ndd in /opt /srv; do
+    [ -d "$ndd" ] || continue
+    while IFS= read -r nde; do
+        [ -z "$nde" ] && continue
+        ndname=$(echo "$nde" | awk '{print $NF}')
+        [ "$ndname" = "." ] || [ "$ndname" = ".." ] && continue
+        OPT_SRV_HITS="${OPT_SRV_HITS}${ndd}/${ndname}\n"
+    done < <(ls -la "$ndd" 2>/dev/null | tail -n +2 | grep '^d' | grep -v '\.\.$')
+done
+if [ -n "$OPT_SRV_HITS" ]; then
+    header "Non-default Directories in /opt, /srv"
+    echo -e "$OPT_SRV_HITS" | while IFS= read -r ndir; do
+        [ -z "$ndir" ] && continue
+        ndperms=$(ls -ld "$ndir" 2>/dev/null | awk '{print $1, $3, $4}')
+        echo -e "  ${YELLOW}→${NC} ${BOLD}$ndir${NC}  ${CYAN}($ndperms)${NC}"
+        FOUND=$((FOUND+1))
+        FOUND_EXTRA=$((FOUND_EXTRA+1))
+    done
+    echo -e "    ${CYAN}Suggestion:${NC} ${GREEN}Enumerate contents — lab creators hide creds/tools/backups here${NC}"
+fi
+
+# --- Recently modified files ---
+RECENT_FILES=$(timeout 20 find / -mmin -4320 -type f \
+    -not -path "/proc/*" -not -path "/sys/*" -not -path "/run/*" \
+    -not -path "/snap/*" -not -path "/var/log/*" -not -path "/usr/src/*" \
+    -not -path "/usr/share/*" -not -path "/var/lib/dpkg/*" -not -path "/var/lib/apt/*" \
+    -not -path "/tmp/.font-unix/*" -not -path "/dev/*" 2>/dev/null | head -20)
+if [ -n "$RECENT_FILES" ]; then
+    header "Recently Modified Files (last 3 days)"
+    while IFS= read -r rf; do
+        [ -z "$rf" ] && continue
+        rf_info=$(ls -la "$rf" 2>/dev/null | awk '{print $1, $3, $4, $6, $7, $8}')
+        echo -e "  ${YELLOW}→${NC} ${BOLD}$rf${NC}"
+        echo -e "    $rf_info"
+    done <<< "$RECENT_FILES"
+    echo -e "    ${CYAN}Suggestion:${NC} ${GREEN}Lab makers leave traces — check these for creds or misconfigs${NC}"
+fi
+
+# --- Internal services (localhost only) ---
+if command -v ss &>/dev/null; then
+    LOCALHOST_SVCS=$(ss -tlnp 2>/dev/null | grep -E '127\.0\.0\.1|::1' | grep -v '^State')
+    if [ -n "$LOCALHOST_SVCS" ]; then
+        header "Internal Services (localhost only)"
+        while IFS= read -r lsvc; do
+            [ -z "$lsvc" ] && continue
+            port=$(echo "$lsvc" | grep -oP ':(\d+)\s' | tr -d ': ' | head -1)
+            svc_hint=""
+            case "$port" in
+                3306) svc_hint="MySQL — try: mysql -u root -h 127.0.0.1" ;;
+                5432) svc_hint="PostgreSQL — try: psql -U postgres -h 127.0.0.1" ;;
+                6379) svc_hint="Redis — try: redis-cli -h 127.0.0.1" ;;
+                27017) svc_hint="MongoDB — try: mongo 127.0.0.1" ;;
+                11211) svc_hint="Memcached — try: echo 'stats' | nc 127.0.0.1 11211" ;;
+                9200) svc_hint="Elasticsearch — try: curl http://127.0.0.1:9200" ;;
+                8080|8443|8000|8888) svc_hint="Web service — try: curl http://127.0.0.1:$port" ;;
+                5000) svc_hint="Dev server — try: curl http://127.0.0.1:5000" ;;
+            esac
+            if [ -n "$svc_hint" ]; then
+                echo -e "  ${RED}✗${NC} Port ${BOLD}$port${NC} — ${YELLOW}$svc_hint${NC}"
+            else
+                echo -e "  ${YELLOW}→${NC} Port ${BOLD}$port${NC} — unknown service"
+            fi
+            echo -e "    $lsvc"
+            FOUND=$((FOUND+1))
+            FOUND_EXTRA=$((FOUND_EXTRA+1))
+        done <<< "$LOCALHOST_SVCS"
+        echo -e "    ${CYAN}Suggestion:${NC} ${GREEN}Internal services often run without auth or with default creds${NC}"
+    fi
+fi
 
 # ==============================================================================
 # RECON INFO (useful context, not direct exploits)
@@ -2290,7 +2465,6 @@ echo -e "${BOLD}${CYAN}═══════════════════
 
 # --- Kernel ---
 echo -e "\n  ${BOLD}Kernel:${NC} $(uname -a 2>/dev/null)"
-echo -e "  ${CYAN}Suggestion:${NC} ${GREEN}searchsploit linux kernel $(uname -r | cut -d- -f1)${NC}"
 
 # --- Listening services ---
 echo -e "\n  ${BOLD}Listening services:${NC}"
