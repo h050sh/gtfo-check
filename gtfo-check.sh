@@ -1966,7 +1966,7 @@ fi
 
 # --- Capabilities ---
 if command -v getcap &>/dev/null; then
-    CAP_OUTPUT=$(timeout 20 getcap -r / 2>/dev/null)
+    CAP_OUTPUT=$(timeout 20 getcap -r / 2>/dev/null | grep -v '/snap/')
     if [ -n "$CAP_OUTPUT" ]; then
         header "Capabilities (getcap)"
         echo -e "  ${CYAN}[GTFOBins matches]${NC}"
@@ -2280,19 +2280,19 @@ while IFS= read -r envfile; do
     [ "$ENV_COUNT" -ge 20 ] && break
 done < <(find /var/www /opt /srv /home /etc -maxdepth 3 \( -name '.env' -o -name '*.conf' -o -name '*.cfg' -o -name '*.ini' -o -name 'wp-config.php' -o -name 'config.php' -o -name 'database.yml' -o -name 'settings.py' -o -name 'application.properties' \) -readable -type f 2>/dev/null)
 
-# --- Backup files & non-default directories ---
-BACKUP_FILES=$(timeout 20 find /opt /srv /tmp /var/backups /backup /backups /home \
-    -type f \( -name "*.zip" -o -name "*.tar*" -o -name "*.gz" -o -name "*.bz2" \
+# --- Backup files & archives ---
+BACKUP_FILES=$(timeout 20 find /opt /srv /tmp /var/backups /backup /backups \
+    -type f -size +0c \( -name "*.zip" -o -name "*.tar*" -o -name "*.gz" -o -name "*.bz2" \
     -o -name "*.bak" -o -name "*.old" -o -name "*.backup" -o -name "*.sql" \
-    -o -name "*.db" -o -name "*.sqlite" -o -name "*.kdbx" -o -name "*.conf" \
-    -o -name "*.config" \) -readable 2>/dev/null)
+    -o -name "*.db" -o -name "*.sqlite" -o -name "*.kdbx" \) -readable 2>/dev/null)
 if [ -n "$BACKUP_FILES" ]; then
     header "Backup Files & Archives"
     BACKUP_COUNT=0
     while IFS= read -r bf; do
         [ -z "$bf" ] && continue
         ftype=$(file -b "$bf" 2>/dev/null | cut -c1-60)
-        echo -e "  ${GREEN}✓${NC} ${BOLD}$bf${NC}"
+        fsize=$(ls -lh "$bf" 2>/dev/null | awk '{print $5}')
+        echo -e "  ${GREEN}✓${NC} ${BOLD}$bf${NC}  ${YELLOW}($fsize)${NC}"
         echo -e "    Type: ${CYAN}$ftype${NC}"
         FOUND=$((FOUND+1))
         FOUND_EXTRA=$((FOUND_EXTRA+1))
@@ -2330,88 +2330,63 @@ while IFS= read -r wcf; do
 done < <(find /var/www /opt /srv -type f \( \
     -name "configuration.php" -o -name "wp-config.php" -o -name ".env" \
     -o -name "config.php" -o -name "settings.py" -o -name "database.yml" \
-    -o -name "appsettings.json" -o -name "conn*.php" -o -name "db.php" \
+    -o -name "appsettings.json" -o -name "db.php" \
     \) -readable 2>/dev/null)
 
-# --- Other users' readable home dirs ---
-HOME_READABLE=""
-if [ -d /home ]; then
-    HOME_DIR_PERMS=$(ls -la /home/ 2>/dev/null | grep '^d' | grep -v '^\.\.$' | grep -v '^\.$' | grep -v "total")
-    HOME_WORLD_READABLE=""
-    while IFS= read -r hline; do
-        [ -z "$hline" ] && continue
-        hperms=$(echo "$hline" | awk '{print $1}')
-        huser=$(echo "$hline" | awk '{print $NF}')
-        [ "$huser" = "$ME" ] && continue
-        [ "$huser" = "." ] || [ "$huser" = ".." ] && continue
-        echo "$hperms" | grep -q 'r..$' && HOME_WORLD_READABLE="${HOME_WORLD_READABLE}${huser} (${hperms})\n"
-    done <<< "$HOME_DIR_PERMS"
-
-    OTHER_HOME_FILES=$(timeout 15 find /home -readable -not -user "$ME" -type f \
-        ! -path "*/snap/*" ! -path "*/.cache/*" ! -path "*/.local/share/Trash/*" \
-        2>/dev/null | head -30)
-
-    if [ -n "$HOME_WORLD_READABLE" ] || [ -n "$OTHER_HOME_FILES" ]; then
-        header "Other Users' Readable Home Dirs"
-        if [ -n "$HOME_WORLD_READABLE" ]; then
-            echo -e "  ${CYAN}[World-readable home directories]${NC}"
-            echo -e "$HOME_WORLD_READABLE" | while IFS= read -r hentry; do
-                [ -z "$hentry" ] && continue
-                echo -e "  ${RED}✗${NC} ${BOLD}/home/$hentry${NC}"
-                FOUND=$((FOUND+1))
-                FOUND_EXTRA=$((FOUND_EXTRA+1))
-            done
-        fi
-        if [ -n "$OTHER_HOME_FILES" ]; then
-            echo -e "  ${CYAN}[Readable files in other users' homes]${NC}"
-            while IFS= read -r ohf; do
-                [ -z "$ohf" ] && continue
-                echo -e "  ${GREEN}✓${NC} $ohf"
-                FOUND=$((FOUND+1))
-                FOUND_EXTRA=$((FOUND_EXTRA+1))
-            done <<< "$OTHER_HOME_FILES"
-        fi
-    fi
+# --- Other users' readable files ---
+OTHER_HOME_FILES=$(timeout 15 find /home -readable -not -user "$ME" \
+    -not -path "*/snap/*" -not -path "*/.cache/*" -type f 2>/dev/null | head -30)
+if [ -n "$OTHER_HOME_FILES" ]; then
+    header "Other Users' Readable Files"
+    while IFS= read -r ohf; do
+        [ -z "$ohf" ] && continue
+        echo -e "  ${GREEN}✓${NC} $ohf"
+        FOUND=$((FOUND+1))
+        FOUND_EXTRA=$((FOUND_EXTRA+1))
+    done <<< "$OTHER_HOME_FILES"
 fi
 
 # --- Cloud-init userdata ---
 if [ -r /var/lib/cloud/instance/user-data.txt ] && [ -s /var/lib/cloud/instance/user-data.txt ]; then
     header "Cloud-init User Data"
-    show_extra "Readable: /var/lib/cloud/instance/user-data.txt" "Cloud VMs often store passwords here" "cat /var/lib/cloud/instance/user-data.txt"
-    grep -inE '(password|passwd|pwd|secret|token)' /var/lib/cloud/instance/user-data.txt 2>/dev/null | head -5 | while IFS= read -r cline; do
-        echo -e "    ${GREEN}$cline${NC}"
-    done
+    echo -e "  ${RED}✗${NC} ${BOLD}/var/lib/cloud/instance/user-data.txt${NC} — Cloud VMs often store passwords here"
+    echo -e "  ${CYAN}[Contents]${NC}"
+    while IFS= read -r udline; do
+        echo -e "    $udline"
+    done < /var/lib/cloud/instance/user-data.txt
+    FOUND=$((FOUND+1))
+    FOUND_EXTRA=$((FOUND_EXTRA+1))
 fi
 
 # --- Non-default directories in /opt, /srv ---
-OPT_SRV_HITS=""
+OPT_SRV_HEADER_SHOWN=false
 for ndd in /opt /srv; do
     [ -d "$ndd" ] || continue
-    while IFS= read -r nde; do
-        [ -z "$nde" ] && continue
-        ndname=$(echo "$nde" | awk '{print $NF}')
-        [ "$ndname" = "." ] || [ "$ndname" = ".." ] && continue
-        OPT_SRV_HITS="${OPT_SRV_HITS}${ndd}/${ndname}\n"
-    done < <(ls -la "$ndd" 2>/dev/null | tail -n +2 | grep '^d' | grep -v '\.\.$')
-done
-if [ -n "$OPT_SRV_HITS" ]; then
-    header "Non-default Directories in /opt, /srv"
-    echo -e "$OPT_SRV_HITS" | while IFS= read -r ndir; do
-        [ -z "$ndir" ] && continue
-        ndperms=$(ls -ld "$ndir" 2>/dev/null | awk '{print $1, $3, $4}')
-        echo -e "  ${YELLOW}→${NC} ${BOLD}$ndir${NC}  ${CYAN}($ndperms)${NC}"
+    for subdir in "$ndd"/*/; do
+        [ -d "$subdir" ] || continue
+        dir_contents=$(ls -A "$subdir" 2>/dev/null)
+        [ -z "$dir_contents" ] && continue
+        if [ "$OPT_SRV_HEADER_SHOWN" = false ]; then
+            header "Non-default Directories in /opt, /srv"
+            OPT_SRV_HEADER_SHOWN=true
+        fi
+        echo -e "  ${YELLOW}→${NC} ${BOLD}${subdir%/}${NC}"
+        ls -la "$subdir" 2>/dev/null | while IFS= read -r lsline; do
+            echo -e "    $lsline"
+        done
         FOUND=$((FOUND+1))
         FOUND_EXTRA=$((FOUND_EXTRA+1))
     done
-    echo -e "    ${CYAN}Suggestion:${NC} ${GREEN}Enumerate contents — lab creators hide creds/tools/backups here${NC}"
-fi
+done
+[ "$OPT_SRV_HEADER_SHOWN" = true ] && echo -e "    ${CYAN}Suggestion:${NC} ${GREEN}Enumerate contents — lab creators hide creds/tools/backups here${NC}"
 
 # --- Recently modified files ---
 RECENT_FILES=$(timeout 20 find / -mmin -4320 -type f \
     -not -path "/proc/*" -not -path "/sys/*" -not -path "/run/*" \
     -not -path "/snap/*" -not -path "/var/log/*" -not -path "/usr/src/*" \
-    -not -path "/usr/share/*" -not -path "/var/lib/dpkg/*" -not -path "/var/lib/apt/*" \
-    -not -path "/tmp/.font-unix/*" -not -path "/dev/*" 2>/dev/null | head -20)
+    -not -path "/usr/share/*" -not -path "/usr/lib/*" -not -path "/var/lib/dpkg/*" \
+    -not -path "/var/lib/apt/*" -not -path "/tmp/.font-unix/*" -not -path "/dev/*" \
+    2>/dev/null | head -20)
 if [ -n "$RECENT_FILES" ]; then
     header "Recently Modified Files (last 3 days)"
     while IFS= read -r rf; do
