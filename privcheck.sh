@@ -1,5 +1,5 @@
 #!/bin/bash
-# GTFOBins Auto-Checker + Extended Linux Privilege Escalation Scanner
+# privcheck — Linux privilege escalation scanner
 # Checks: SUID, SGID, capabilities, sudo, cron, PATH hijack, kernel,
 #          docker/lxd groups, NFS, /etc/passwd+shadow, systemd, credentials,
 #          LD_PRELOAD, internal services, writable /etc, .service files
@@ -1837,9 +1837,9 @@ for arg in "$@"; do
         --no-color)   RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; NC='' ;;
         -h|--help)
             cat <<'USAGE'
-gtfo-check — Linux privilege escalation scanner
+privcheck — Linux privilege escalation scanner
 
-Usage: gtfo-check.sh [options]
+Usage: privcheck.sh [options]
 
   -v, --verbose   Also print recon context (kernel, mounts, root procs, all caps)
       --no-color  Disable ANSI colors (for piping to a file)
@@ -2802,7 +2802,7 @@ done
 # Secrets passed on a command line are readable by every user via /proc.
 PS_CREDS=$(ps -eo user=,args= 2>/dev/null \
     | grep -iE '(password|passwd|pwd|secret|token|api[_-]?key)=[^[:space:]]|MYSQL_PWD=|PGPASSWORD=|[[:space:]]-p[^[:space:]-]{3,}' \
-    | grep -viE 'gtfo-check|grep -|ps -eo' | head -8)
+    | grep -viE 'privcheck|grep -|ps -eo' | head -8)
 [ -n "$PS_CREDS" ] && add_finding HIGH "Credentials visible in a process command line" \
     "$(printf '%s\n' "$PS_CREDS" | cut -c1-150 | cap_list 8)" \
     "ps -eo user=,args= | grep -iE 'passw|secret|token'"
@@ -2955,7 +2955,7 @@ TOTAL=$(wc -l < "$FINDINGS" 2>/dev/null | tr -d ' ')
 
 echo ""
 echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}${CYAN}║  gtfo-check — privilege escalation report            ║${NC}"
+echo -e "${BOLD}${CYAN}║  privcheck — privilege escalation report              ║${NC}"
 echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
 echo -e "  user: ${BOLD}${ME}${NC}   host: $(hostname 2>/dev/null)   findings: ${BOLD}${TOTAL}${NC}"
 [ "$IS_ROOT" -eq 1 ] && echo -e "  ${YELLOW}already uid 0 — writable-path checks skipped, looting only${NC}"
